@@ -415,8 +415,10 @@ def render_frame_job(args):
     # 3. Overlay marker spheres (e.g. EE goal positions)
     if marker_positions is not None:
         scene = renderer.scene
-        sphere_rgba = np.array([1.0, 0.2, 0.2, 0.8], dtype=np.float32)
-        sphere_size = np.array([0.025, 0.0, 0.0], dtype=np.float32)
+        sphere_rgba = np.array([1.0, 0.2, 0.2, 0.85], dtype=np.float32)
+        sphere_size = np.array(
+            [0.06, 0.0, 0.0], dtype=np.float32
+        )  # goal marker, visible at play distance
         eye3 = np.eye(3, dtype=np.float32).flatten()
         for env_idx in range(num_envs):
             if scene.ngeom >= scene.maxgeom:
@@ -685,8 +687,10 @@ def render_frame_tracking_job(args):
     # Overlay marker spheres for rendered envs
     if marker_positions is not None:
         scene = renderer.scene
-        sphere_rgba = np.array([1.0, 0.2, 0.2, 0.8], dtype=np.float32)
-        sphere_size = np.array([0.025, 0.0, 0.0], dtype=np.float32)
+        sphere_rgba = np.array([1.0, 0.2, 0.2, 0.85], dtype=np.float32)
+        sphere_size = np.array(
+            [0.06, 0.0, 0.0], dtype=np.float32
+        )  # goal marker, visible at play distance
         eye3 = np.eye(3, dtype=np.float32).flatten()
         for global_i in env_indices:
             if scene.ngeom >= scene.maxgeom:

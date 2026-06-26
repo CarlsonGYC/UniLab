@@ -4,6 +4,57 @@
 
 UniLab 是一个 **高性能、模块化、contract 驱动** 的 RL infrastructure 仓库。
 
+## Build / Test / Run Commands
+
+Everything runs through `uv` — never call `python` / `pytest` / `ruff` directly.
+
+### Setup
+- `make setup` — sync both backends (`--extra mujoco --extra motrix`) + shell completion.
+- `make setup-mujoco` / `make setup-motrix` — single backend; `make sync-rocm` / `make sync-xpu` — AMD ROCm / Intel XPU torch wheels.
+- Backends are optional extras: `--sim mujoco` needs the `mujoco` extra, `--sim motrix` needs `motrix`; the CLI fails fast with an install hint if the extra is missing.
+
+### Dev loop (run before any code commit)
+- `make format` — `ruff format` + `ruff check --fix` (line length 100, target py310).
+- `make type` — `mypy src/unilab` + `pyright`.
+- `make check` — format + type. **`make test-all` (= `check` + `test-cov`) is the PR gate.**
+- `make test` non-slow / `make test-cov` + coverage / `make test-slow` runs the `slow`-marked backend + training smoke tests.
+- Single test: `uv run pytest tests/ipc/test_async_runner.py::test_name -q`. `slow` tests are deselected by default (`addopts = -m 'not slow'`); add `-m slow` to include them.
+- Docs-only change still needs `uv run pytest tests/scripts/test_check_docs.py -q`; repo-hygiene changes need `tests/scripts/test_repo_hygiene.py`.
+
+### Training / eval (unified CLI — preferred entrypoint)
+- `uv run train --algo <ppo|mlx_ppo|appo|sac|td3|flashsac> --task <task> --sim <mujoco|motrix> [--profile hora] [hydra.overrides=...]`
+- `uv run eval --algo ... --task ... --sim ... --load-run -1 [--render-mode auto|interactive|record|none]`
+- `uv run demo <name>` — pretrained playback (`teaser`, `dance`, `wallflip`, `boxtracking`, `locomani`, `inhandgrasp`, ...); assets/checkpoints auto-download from Hugging Face on first run.
+- Hydra passthrough overrides are allowed **except** route-defining keys (`algo`, `task`, `training.sim_backend`, `training.play_only`) — those must come from flags. Backend is selected by `--sim` (which picks the owner YAML); do **not** override `training.sim_backend` to switch backends.
+
+## Architecture Big Picture
+
+Heterogeneous runtime (see README diagram): CPU-parallel physics (MuJoCoUni / MotrixSim) step in worker processes and stream transitions through shared memory (`src/unilab/ipc/`) to a GPU learner (PPO / SAC / TD3 / APPO). The async collector↔learner lifecycle lives in `src/unilab/ipc/async_runner.py` — do not start a parallel sync protocol around it.
+
+### CLI → script → config-group routing (`src/unilab/cli.py:build_route`)
+The `train`/`eval` CLI carries **no training logic** — it resolves `(algo, task, sim, profile)` to an entrypoint script + Hydra owner YAML and execs it. This is the single map that ties algos, scripts, and `conf/` together:
+
+| algo | script (`scripts/`) | owner YAML path under `conf/` |
+|------|---------------------|-------------------------------|
+| `ppo` | `train_rsl_rl.py` | `ppo/task/<task>/<sim>.yaml` |
+| `mlx_ppo` (macOS only) | `train_mlx_ppo.py` | `ppo/task/<task>/<sim>.yaml` |
+| `appo` | `train_appo.py` | `appo/task/<task>/<sim>.yaml` |
+| `sac` / `td3` / `flashsac` | `train_offpolicy.py` | `offpolicy/task/<algo>/<task>/<sim>.yaml` |
+
+`--profile hora` appends to the backend id, so the owner file becomes `<sim>_<profile>.yaml` (e.g. `offpolicy/task/sac/sharpa_inhand/mujoco_hora.yaml`). Per-task DENYLIST fields are shared via a sibling `base.yaml` (e.g. `conf/ppo/task/g1_walk_flat/{base,mujoco,motrix}.yaml`). Standalone script-level entrypoints exist for paths the CLI doesn't route (`scripts/train_him_ppo.py`, `train_hora_distill.py`).
+
+### Source layers (`src/unilab/`)
+- `base/` — env + backend contracts. `np_env.py` (`NpEnv`/`NpEnvState`, the dict-obs invariant), `backend/base.py` (`SimBackend` abstract interface — the **only** backend surface env code may call), plus `registry.py`, `scene.py`, `observations.py`, `curriculum.py`.
+- `backend/{mujoco,motrix}` (under `base/backend/`) — backend adapters; all backend-specific logic stays here.
+- `envs/` — concrete tasks: `locomotion/` (g1, go1, go2, go2_arm, go2w), `manipulation/`, `motion_tracking/`; shared numerics in `envs/common/{rotation,math}.py`.
+- `algos/torch/` — `rsl_rl_ppo`, `appo`, `offpolicy`, `fast_sac`, `fast_td3`, `flash_sac`, `him_ppo`, `hora`; `algos/mlx/` — Apple-Silicon MLX PPO.
+- `training/` — Hydra-side glue: `run.py`, `reward.py`, `experiment.py` (writes `contract_snapshot` to `run_config.json`), `sim2sim.py` (cross-backend contract), `backend_adapter.py`.
+- `ipc/` — shared-memory transport: `shared_buffer.py`, `replay_buffer.py`, `replay_pipelines/` (CPU-pinned + multi-GPU H2D), `weight_sync.py`.
+- `terrains/`, `dr/` (domain randomization), `visualization/`, `tools/` (the `unilab-*` console scripts in `pyproject.toml`).
+- `utils/` is **transition shims only** (scheduled for removal in 0.2.0) — do not add owner logic there.
+
+Tests mirror the source tree under `tests/<module>/`; integration + cross-backend matrices live in `tests/integration/` and are mostly `slow`-marked.
+
 ## Core Principles
 
 1. **Contract first**: 不为了一次通过绕过 env / backend / runner contract。

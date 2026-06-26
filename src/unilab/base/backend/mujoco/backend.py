@@ -734,6 +734,9 @@ class MuJoCoBackend(SimBackend):
     def get_body_ipos(self) -> np.ndarray:
         return np.asarray(self._model.body_ipos, dtype=np.float64).copy()
 
+    def get_body_inertia(self) -> np.ndarray:
+        return np.asarray(self._model.body_inertia, dtype=np.float64).copy()
+
     def get_dof_armature(self) -> np.ndarray:
         return np.asarray(self._model.dof_armature, dtype=np.float64).copy()
 

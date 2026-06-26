@@ -1,0 +1,24 @@
+# Single-drone circle test — trajectory + run parameters.
+# Trajectory field names mirror the real-flight test code
+# (realflight_ws/src/traj_test/config/traj_params.yaml).
+
+trajectory:
+  circle_radius: 1.0        # [m]   realflight: circle_radius (1.0)
+  circle_duration: 3.0      # [s]   seconds per lap (realflight: circle_duration 4.0 — we relax it)
+  circle_times: 2           # laps  realflight: circle_times (4)
+  ramp_up_time: 2.0         # [s]   realflight: ramp_up_time (8.0)
+  ramp_down_time: 2.0       # [s]   realflight: ramp_down_time (8.0)
+  circle_init_phase: 0.0    # [rad] realflight: circle_init_phase (0.0)
+  base_height: 1.5          # [m]   circle-plane altitude (realflight NED center_z = -1.2)
+
+multi_env:
+  num_envs: 9               # number of parallel drones (batched on GPU)
+  env_spacing: 8.0          # [m] grid spacing between envs (>> 2*circle_radius to avoid overlap)
+
+control:
+  decimation: 5             # sim steps per control step (5 @ 500 Hz sim => 100 Hz position loop)
+  hover_thrust: 0.0         # 0 = use drone_config (charpi MPC_THR_HOVER=0.26); >0 overrides
+  props: visual             # "visual" (fold props into body) or "physical"
+
+run:
+  settle_time: 3.0          # [s] extra hover time logged after the trajectory ends

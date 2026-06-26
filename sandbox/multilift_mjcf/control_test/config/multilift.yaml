@@ -1,0 +1,31 @@
+# Multi-drone cable-lift circle test — trajectory + scene + run parameters.
+# Trajectory field names mirror the real-flight test code
+# (realflight_ws/src/traj_test/config/traj_params.yaml); the formation follows
+# the geom_multilift convention (drones above the payload on a circle).
+
+trajectory:
+  circle_radius: 0.5        # [m]   smaller than single-drone: the slung payload swings
+  circle_duration: 8.0      # [s]   seconds per lap
+  circle_times: 2           # laps
+  ramp_up_time: 4.0         # [s]
+  ramp_down_time: 4.0       # [s]
+  circle_init_phase: 0.0    # [rad]
+  base_height: 1.5          # [m]   payload hover altitude
+
+scene:
+  num_ropes: 4              # number of drones / cables
+  rope_length: 1.0          # [m]   cable length (realflight geom_multilift: l = 1.0)
+  payload_mass: 2.0         # [kg]
+  elevation_angle: 40.0     # [deg] cable elevation from horizontal (sets the splay)
+  props: visual
+
+multi_env:
+  num_envs: 4               # number of parallel formations (batched on GPU)
+  env_spacing: 6.0          # [m] grid spacing between envs
+
+control:
+  decimation: 5             # 5 @ 500 Hz sim => 100 Hz position loop
+  hover_thrust: 0.0         # 0 = auto-calibrate per drone (incl. payload share)
+
+run:
+  settle_time: 3.0          # [s] extra hover time logged after the trajectory ends

@@ -196,6 +196,10 @@ class SimBackend(abc.ABC):
         """Return the backend body inertial-position table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose body ipos")
 
+    def get_body_inertia(self) -> np.ndarray:
+        """Return the backend body diagonal-inertia table (nbody, 3), principal-axis frame."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose body inertia")
+
     def get_dof_armature(self) -> np.ndarray:
         """Return the backend dof-armature table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose dof armature")
