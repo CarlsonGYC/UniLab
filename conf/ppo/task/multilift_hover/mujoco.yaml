@@ -7,12 +7,18 @@ training:
 env:
   # exposed env knobs — override directly on the CLI (e.g. env.curriculum_steps=50000)
   curriculum_enabled: true
-  # progress = step_counter / curriculum_steps. Sized to the 500k budget: every phase is fully
-  # open by 0.90*200k = 180k steps (~36%), leaving ~320k steps at full difficulty to converge.
-  curriculum_steps: 200000.0
+  # progress = step_counter / curriculum_steps. direct_rl used 250k control steps; every phase is
+  # fully open by 0.90*250k = 225k steps, leaving the rest of the 500k per-env budget at full difficulty.
+  curriculum_steps: 250000.0
+  v_max: 0.8
+  a_max: 0.8
+  zero_vel_acc_cmd: true
+  action_filter_tau: 0.5
   randomize_payload_mass: true
   randomize_payload_inertia: true   # inertia tracks mass + independent jitter (mass/inertia self-consistent)
   randomize_actuators: true
+  push_payload: true                # mid-episode random force pulse on the payload (ramped in late by DR curriculum)
+  push_max_force: [3.0, 3.0, 3.0]
   payload_mass: 2.0
   payload_mass_range: 0.4
   payload_inertia_range: 0.4
@@ -22,7 +28,7 @@ algo:
   num_steps_per_env: 24
   # 500k PER-ENV control-step budget (= 20834 iter x 24). step_counter advances 24/iter (independent
   # of num_envs), so the curriculum below is sized to these 500k control-steps. NOTE the aggregate
-  # sample count is num_envs x that, i.e. 1024 x 500k ~= 0.51B transitions — scale max_iterations down
+  # sample count is num_envs x that, i.e. 512 x 500k ~= 0.26B transitions — scale max_iterations down
   # if you want fewer total samples (the curriculum_steps env knob is what fixes the 500k horizon).
   max_iterations: 20834
   empirical_normalization: true
@@ -38,23 +44,23 @@ algo:
   algorithm:
     # CapsPPO = PPO + CAPS spatial action-smoothness regularizer (Mysore 2021), ON by default.
     # lambda_s ramps 0 -> caps_lambda_s over [warmup_frac, full_frac] of training, so smoothing only
-    # kicks in once the env curriculum reaches full difficulty (~0.40) — early exploration is free.
-    # max_action_std caps the policy std (direct_rl clip_log_std/max_log_std=-0.5 -> exp(-0.5)=0.607).
+    # kicks in after basic hover is learned. direct_rl used sigma=0.25 and a 20%-50% ramp.
+    # max_action_std caps policy std near direct_rl max_log_std=-1.0 -> exp(-1)=0.368.
     # Set caps_lambda_s: 0.0 to fall back to plain PPO.
     class_name: unilab.algos.torch.caps_ppo:CapsPPO
     caps_lambda_s: 0.5
-    caps_sigma: 0.05
-    caps_warmup_frac: 0.40
-    caps_full_frac: 0.80
+    caps_sigma: 0.25
+    caps_warmup_frac: 0.20
+    caps_full_frac: 0.50
     caps_total_iters: ${algo.max_iterations}
-    max_action_std: 0.6
+    max_action_std: 0.37
     learning_rate: 3.0e-4         # direct_rl: 1e-3 was prone to early instability (KLAdaptive there)
     num_learning_epochs: 5
     num_mini_batches: 4
     clip_param: 0.2
-    entropy_coef: 0.002           # direct_rl: 0.005 actively pushed std up to the cap
+    entropy_coef: 0.002
     value_loss_coef: 2.0
-    desired_kl: 0.01
+    desired_kl: 0.02              # raised threshold: adaptive LR only throttles above KL>0.04 (was 0.02)
     max_grad_norm: 1.0
     gamma: 0.99
     lam: 0.95
@@ -70,7 +76,8 @@ reward:
     formation: 1.0
     drone_upright: 0.05
     drone_omega: 0.005
-    action: 0.01          # direct_rl k_action (raised 5x: eval showed raw output near the clamp)
+    action: 0.02
+    action_sat: 0.5
     smooth: 0.02
     smooth2: 0.01
     proximity: 100.0
@@ -78,4 +85,5 @@ reward:
     alive: 0.1
   crash_penalty: 10.0
   sigma_pos: 0.3
+  pos_deadband: 0.05
   sigma_form: 0.4
