@@ -26,11 +26,11 @@ env:
 algo:
   num_envs: 512
   num_steps_per_env: 24
-  # 500k PER-ENV control-step budget (= 20834 iter x 24). step_counter advances 24/iter (independent
-  # of num_envs), so the curriculum below is sized to these 500k control-steps. NOTE the aggregate
-  # sample count is num_envs x that, i.e. 512 x 500k ~= 0.26B transitions — scale max_iterations down
-  # if you want fewer total samples (the curriculum_steps env knob is what fixes the 500k horizon).
-  max_iterations: 20834
+  # 800k PER-ENV control-step budget (= 33334 iter x 24), matching direct_rl's raised total_timesteps
+  # (motor DR + smoothness/CAPS regularizers need more samples to converge). step_counter advances
+  # 24/iter (independent of num_envs); curriculum_steps=250k opens the curriculum by ~28% of this
+  # budget, leaving the rest at full difficulty. Aggregate samples ~= 512 x 800k = 0.41B transitions.
+  max_iterations: 33334
   empirical_normalization: true
   obs_groups:
     actor: [policy]
@@ -58,9 +58,12 @@ algo:
     num_learning_epochs: 5
     num_mini_batches: 4
     clip_param: 0.2
-    entropy_coef: 0.002
+    # direct_rl uses 0.002, but on skrl whose KLAdaptive lacks rsl_rl's hard 1e-5 LR floor. On rsl_rl,
+    # 0.002 let std collapse to ~0.075 over the long run, inflating KL and pinning LR at 1e-5 for 7 h.
+    # 0.003 keeps std nearer the 0.37 cap so KL stays bounded and LR stays healthy across the 800k run.
+    entropy_coef: 0.003
     value_loss_coef: 2.0
-    desired_kl: 0.02              # raised threshold: adaptive LR only throttles above KL>0.04 (was 0.02)
+    desired_kl: 0.02              # raised threshold: adaptive LR only throttles above KL>0.04 (was 0.01)
     max_grad_norm: 1.0
     gamma: 0.99
     lam: 0.95
