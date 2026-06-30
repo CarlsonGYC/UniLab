@@ -25,15 +25,21 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as tmp  # torch.multiprocessing for spawn
 
+from unilab.algos.torch.offpolicy.distributed import (
+    normalize_distributed_sync_mode,
+    resolve_distributed_learner_hooks,
+    validate_distributed_learner_capability,
+)
 from unilab.algos.torch.offpolicy.runner import (
     OffPolicyRunner,
     build_offpolicy_sample_info,
     build_reward_comparison_metrics,
     compute_train_start_threshold,
     replay_buffer_ready_for_learning,
+    update_reward_stats_from_replay,
 )
 from unilab.algos.torch.offpolicy.worker import off_policy_collector_fn
-from unilab.ipc import SharedWeightSync
+from unilab.ipc import SharedObsNormStats, SharedWeightSync
 from unilab.ipc.async_runner import _SPAWN_CTX
 from unilab.ipc.replay_buffer import ReplayBuffer
 from unilab.ipc.replay_pipelines.multi_gpu_cpu_pinned import MultiGPUCPUPinnedReplayPipeline
@@ -41,7 +47,6 @@ from unilab.logging import OffPolicyLogger
 from unilab.training.seed import apply_training_seed, derive_worker_seed
 
 MULTIGPU_REPLAY_READY_POLL_SEC = 0.001
-MULTIGPU_SYNC_MODES = {"sync_sgd", "local_sgd"}
 
 
 class _CollectorDiedError(RuntimeError):
@@ -56,11 +61,7 @@ def _find_free_port() -> int:
 
 def normalize_multi_gpu_sync_mode(mode: str) -> str:
     """Return a validated multi-GPU learner synchronization mode."""
-    normalized = str(mode).strip().lower()
-    if normalized not in MULTIGPU_SYNC_MODES:
-        supported = ", ".join(sorted(MULTIGPU_SYNC_MODES))
-        raise ValueError(f"training.multi_gpu_sync_mode must be one of: {supported}; got {mode!r}")
-    return normalized
+    return normalize_distributed_sync_mode(mode)
 
 
 def normalize_multi_gpu_sync_interval(interval: int) -> int:
@@ -94,6 +95,9 @@ def _drain_metrics(
                 logger.update_ep_length(m["mean_ep_length"])
             if "collector_timing_ms" in m and logger:
                 logger.update_collector_timing(m["collector_timing_ms"])
+            collector_active_steps_per_sec = m.get("collector_active_steps_per_sec")
+            if collector_active_steps_per_sec is not None and logger:
+                logger.update_collector_active_steps_per_sec(float(collector_active_steps_per_sec))
             if ("timeout_rate" in m or "terminated_rate" in m) and logger:
                 logger.update_done_rates(
                     timeout_rate=float(m.get("timeout_rate", 0.0)),
@@ -120,6 +124,28 @@ def _put_trainer_done_or_stop(trainer_done_queue: Any, stop_event: Any) -> bool:
         except queue.Full:
             continue
     return False
+
+
+def _publish_obs_normalizer_stats(learner: Any, shared_obs_normalizer_stats: Any) -> None:
+    if shared_obs_normalizer_stats is None:
+        return
+    normalizer = getattr(learner, "obs_normalizer", None)
+    if normalizer is None:
+        return
+    try:
+        mean = normalizer.mean
+        std = normalizer.std
+    except Exception:
+        return
+    if not torch.is_tensor(mean) or not torch.is_tensor(std):
+        return
+    shared_obs_normalizer_stats.put((mean.detach().cpu().numpy(), std.detach().cpu().numpy()))
+
+
+def _format_multi_gpu_algo_name(algo_type: str, world_size: int) -> str:
+    if algo_type == "flashsac":
+        return f"FlashSAC_x{world_size}GPU"
+    return f"Fast{algo_type.upper()}_x{world_size}GPU"
 
 
 def _learner_worker(
@@ -164,19 +190,23 @@ def _learner_worker(
         replay_buffer.device = device
 
         # 2. Create learner on this device
-        learner_kwargs = dict(learner_kwargs)
-        learner_kwargs["distributed_sync_mode"] = normalize_multi_gpu_sync_mode(
+        sync_mode = normalize_multi_gpu_sync_mode(
             str(runner_kwargs.get("multi_gpu_sync_mode", "local_sgd"))
         )
+        learner_kwargs = dict(learner_kwargs)
+        learner_kwargs["distributed_sync_mode"] = sync_mode
         learner = learner_cls(device=device, world_size=world_size, **learner_kwargs)
 
         # 3. Broadcast rank-0 params so all workers start identically.
-        sync_initial_parameters = getattr(learner, "sync_initial_parameters", None)
-        if not callable(sync_initial_parameters):
-            raise ValueError(
-                "Multi-GPU off-policy learner must implement sync_initial_parameters(src=0)"
-            )
-        sync_initial_parameters(src=0)
+        distributed_hooks = resolve_distributed_learner_hooks(learner, sync_mode=sync_mode)
+        distributed_hooks.sync_initial_parameters(src=0)
+        sync_reward_normalizer = getattr(learner, "sync_reward_normalizer", None)
+        if not callable(sync_reward_normalizer):
+            sync_reward_normalizer = None
+        has_reward_stats = (
+            hasattr(learner, "update_reward_stats")
+            and getattr(learner, "reward_normalizer", None) is not None
+        )
 
         # 4. Reconnect to the shared weight-sync buffer
         weight_sync = SharedWeightSync(
@@ -197,12 +227,11 @@ def _learner_worker(
         obs_dim: int = runner_kwargs["obs_dim"]
         action_dim: int = runner_kwargs["action_dim"]
         logger_type: str = runner_kwargs.get("logger_type", "tensorboard")
-        sync_mode = normalize_multi_gpu_sync_mode(
-            str(runner_kwargs.get("multi_gpu_sync_mode", "local_sgd"))
-        )
         sync_interval = normalize_multi_gpu_sync_interval(
             int(runner_kwargs.get("multi_gpu_sync_interval", 1))
         )
+        obs_normalization = bool(runner_kwargs.get("obs_normalization", False))
+        shared_obs_normalizer_stats = runner_kwargs.get("shared_obs_normalizer_stats")
         learning_starts = max(int(runner_kwargs.get("learning_starts", 0)), 0)
         train_start_threshold = compute_train_start_threshold(batch_size, learning_starts, num_envs)
         sample_count = batch_size * updates_per_step
@@ -223,7 +252,10 @@ def _learner_worker(
         if rank == 0:
             os.makedirs(log_dir, exist_ok=True)
             logger = OffPolicyLogger(
-                algo_name=f"Fast{str(runner_kwargs.get('algo_type', 'offpolicy')).upper()}_x{world_size}GPU",
+                algo_name=_format_multi_gpu_algo_name(
+                    str(runner_kwargs.get("algo_type", "offpolicy")),
+                    world_size,
+                ),
                 max_iterations=max_iterations,
                 num_envs=num_envs,
                 env_name=env_name,
@@ -255,11 +287,15 @@ def _learner_worker(
         write_read_ema = 0.0
         last_buf_log = 0
         prepared_tick: int | None = None
+        reward_stats_ptr = 0
 
         # 7. Training loop
         for it in range(1, max_iterations + 1):
             iteration_start = time.perf_counter()
             collector_released_for_next = False
+            sync_coordination_time = 0.0
+            collector_wait_overhead = 0.0
+
             # --- Wait for data (rank 0 only, then barrier syncs everyone) ---
             wait_start = time.perf_counter()
             if rank == 0:
@@ -283,9 +319,16 @@ def _learner_worker(
                             break
                         if logger and cur_size - last_buf_log >= num_envs * 10:
                             last_buf_log = cur_size
+                            _fill_t = time.perf_counter()
                             logger.log_buffer_fill(cur_size, train_start_threshold)
+                            collector_wait_overhead += time.perf_counter() - _fill_t
                         if trainer_done_queue is not None:
-                            if not _put_trainer_done_or_stop(trainer_done_queue, stop_event):
+                            _coord_t = time.perf_counter()
+                            _ok = _put_trainer_done_or_stop(trainer_done_queue, stop_event)
+                            _coord_d = time.perf_counter() - _coord_t
+                            sync_coordination_time += _coord_d
+                            collector_wait_overhead += _coord_d
+                            if not _ok:
                                 return
                 else:
                     while not replay_buffer_ready_for_learning(
@@ -299,26 +342,68 @@ def _learner_worker(
                         cur_size = int(replay_buffer.size[0])
                         if logger and cur_size - last_buf_log >= num_envs * 10:
                             last_buf_log = cur_size
+                            _fill_t = time.perf_counter()
                             logger.log_buffer_fill(cur_size, train_start_threshold)
+                            collector_wait_overhead += time.perf_counter() - _fill_t
                         time.sleep(MULTIGPU_REPLAY_READY_POLL_SEC)
                 _drain_metrics(metrics_queue, reward_history, latest_reward_components, logger)
 
+            collector_wait_time = (
+                time.perf_counter() - wait_start - collector_wait_overhead if rank == 0 else 0.0
+            )
+
+            _barrier_initial_start = time.perf_counter()
             dist.barrier()
-            wait_time = time.perf_counter() - wait_start if rank == 0 else 0.0
+            barrier_initial_time = (
+                time.perf_counter() - _barrier_initial_start if rank == 0 else 0.0
+            )
 
             # --- Training: each rank independently samples a different mini-batch ---
             iter_metrics: dict = defaultdict(list)
             ptr_before = int(replay_buffer.ptr[0]) if rank == 0 else 0
+            replay_ptr = int(replay_buffer.ptr[0])
+            if sync_reward_normalizer is None or rank == 0:
+                reward_stats_ptr = update_reward_stats_from_replay(
+                    learner,
+                    replay_buffer,
+                    start_ptr=reward_stats_ptr,
+                    end_ptr=replay_ptr,
+                    num_envs=num_envs,
+                )
+            else:
+                reward_stats_ptr = replay_ptr
+            if has_reward_stats and sync_reward_normalizer is not None:
+                sync_reward_normalizer(src=0)
 
             if prepared_tick != it:
-                replay_pipeline.start_prepare(it, sample_count)
+                min_prepare_ptr = train_start_threshold if it == 1 else int(replay_buffer.ptr[0])
+                replay_pipeline.start_prepare(
+                    it,
+                    sample_count,
+                    min_snapshot_ptr=min_prepare_ptr,
+                )
                 prepared_tick = it
+            replay_batch_ready_wait_time = 0.0
             if not replay_pipeline.batch_ready(it, sample_count):
+                replay_batch_ready_wait_start = time.perf_counter()
                 while not replay_pipeline.batch_ready(it, sample_count):
                     if stop_event.is_set():
                         return
                     time.sleep(MULTIGPU_REPLAY_READY_POLL_SEC)
+                replay_batch_ready_wait_time = (
+                    time.perf_counter() - replay_batch_ready_wait_start if rank == 0 else 0.0
+                )
+            if rank == 0:
+                # Multi-GPU replay batches are produced by the synchronized collector-side
+                # pack service, so this wait belongs with collector readiness rather than
+                # the single-GPU/double-buffer Replay Batch Wait metric.
+                collector_wait_time += replay_batch_ready_wait_time
+            replay_batch_wait_time = 0.0
+            replay_sample_start = time.perf_counter()
             large_batch = replay_pipeline.sample_large_batch(it, sample_count)
+            learner_replay_sample_time = (
+                time.perf_counter() - replay_sample_start if rank == 0 else 0.0
+            )
             learner_incremental_h2d_time = (
                 float(getattr(replay_pipeline, "last_incremental_h2d_time_s", 0.0))
                 if rank == 0
@@ -326,16 +411,26 @@ def _learner_worker(
             )
 
             if it < max_iterations:
-                min_snapshot_ptr = int(replay_buffer.ptr[0]) + (num_envs * env_steps_per_sync)
+                # Prefetch from the current replay snapshot. The loop still waits for one
+                # synchronized collector chunk per iteration, but off-policy SAC does not
+                # need the just-collected rows to be present in the next sampled batch.
+                # Avoiding that dependency lets CPU random gather for every rank overlap
+                # with the next collector env.step instead of sitting on the learner's
+                # critical path.
+                min_snapshot_ptr = int(replay_buffer.ptr[0])
                 replay_pipeline.start_prepare(
                     it + 1,
                     sample_count,
                     min_snapshot_ptr=min_snapshot_ptr,
+                    sample_snapshot_mode="request",
+                    exclude_write_count=num_envs * env_steps_per_sync,
                 )
                 prepared_tick = it + 1
                 if rank == 0 and sync_collection and trainer_done_queue is not None:
+                    _sync_coord_start = time.perf_counter()
                     if not _put_trainer_done_or_stop(trainer_done_queue, stop_event):
                         return
+                    sync_coordination_time += time.perf_counter() - _sync_coord_start
                     collector_released_for_next = True
 
             train_start = time.perf_counter()
@@ -358,6 +453,8 @@ def _learner_worker(
 
             replay_pipeline.after_tick()
 
+            train_time = time.perf_counter() - train_start if rank == 0 else 0.0
+
             should_save_checkpoint = save_interval > 0 and it % save_interval == 0
             should_param_sync = sync_mode == "local_sgd" and (
                 it % sync_interval == 0 or it == max_iterations or should_save_checkpoint
@@ -366,25 +463,22 @@ def _learner_worker(
             did_param_sync = False
             if should_param_sync:
                 param_sync_start = time.perf_counter()
-                average_parameters = getattr(learner, "average_distributed_parameters", None)
-                if not callable(average_parameters):
-                    raise ValueError(
-                        "Multi-GPU local_sgd requires learner.average_distributed_parameters()"
-                    )
-                average_parameters()
+                distributed_hooks.average_distributed_parameters()
                 param_sync_time = time.perf_counter() - param_sync_start
                 did_param_sync = True
 
-            # train_time intentionally includes local-SGD parameter sync and the
-            # final rank barrier. The separate param-sync timing is a sub-breakdown.
+            _barrier_final_start = time.perf_counter()
             dist.barrier()
-            train_time = time.perf_counter() - train_start if rank == 0 else 0.0
+            barrier_final_time = time.perf_counter() - _barrier_final_start if rank == 0 else 0.0
+            rank_barrier_time = barrier_initial_time + barrier_final_time
 
             # --- Post-iteration work: rank 0 only ---
             if rank == 0:
                 learner.update_count += 1
                 weight_sync_time = 0.0
                 if sync_mode != "local_sgd" or did_param_sync:
+                    if obs_normalization:
+                        _publish_obs_normalizer_stats(learner, shared_obs_normalizer_stats)
                     weight_sync_start = time.perf_counter()
                     weight_sync.write_weights(learner.actor.state_dict())
                     weight_sync_time = time.perf_counter() - weight_sync_start
@@ -394,8 +488,10 @@ def _learner_worker(
                     and trainer_done_queue is not None
                     and not collector_released_for_next
                 ):
+                    _sync_coord_start = time.perf_counter()
                     if not _put_trainer_done_or_stop(trainer_done_queue, stop_event):
                         return
+                    sync_coordination_time += time.perf_counter() - _sync_coord_start
                 iteration_time = time.perf_counter() - iteration_start
 
                 write_delta = int(replay_buffer.ptr[0]) - ptr_before
@@ -416,13 +512,20 @@ def _learner_worker(
                         reward_metrics=build_reward_comparison_metrics(reward_history, mean_reward),
                         reward_components=latest_reward_components,
                         train_time=train_time,
-                        wait_time=wait_time,
+                        collector_wait_time=collector_wait_time,
+                        replay_batch_wait_time=replay_batch_wait_time,
+                        learner_replay_sample_time=learner_replay_sample_time,
+                        rank_barrier_time=rank_barrier_time,
+                        sync_coordination_time=sync_coordination_time,
                         learner_incremental_h2d_time=learner_incremental_h2d_time,
                         weight_sync_time=weight_sync_time,
                         learner_param_sync_time=param_sync_time,
                         iteration_time=iteration_time,
                         extra_info={
                             "throughput_steps": num_envs * env_steps_per_sync,
+                            "collector_active_steps_per_sec": (
+                                logger._collector_active_steps_per_sec
+                            ),
                             "world_size": world_size,
                             "multi_gpu_sync_mode": sync_mode,
                             "multi_gpu_sync_interval": sync_interval,
@@ -482,16 +585,18 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
     def validate_capabilities(
         *,
         algo_type: str,
+        learner_cls: Any,
         learner_kwargs: Dict[str, Any],
         num_gpus: int,
+        sync_mode: str = "local_sgd",
     ) -> None:
-        if num_gpus <= 1:
-            return
-        if algo_type == "sac" and bool(learner_kwargs.get("use_symmetry", False)):
-            raise ValueError(
-                "Off-policy symmetry augmentation does not support training.num_gpus > 1; "
-                "set training.num_gpus=1 or algo.use_symmetry=false"
-            )
+        validate_distributed_learner_capability(
+            learner_cls=learner_cls,
+            algo_type=algo_type,
+            learner_kwargs=learner_kwargs,
+            num_gpus=num_gpus,
+            sync_mode=sync_mode,
+        )
 
     def __init__(
         self,
@@ -506,10 +611,13 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
         multi_gpu_sync_interval: int = 1,
         **kwargs: Any,
     ) -> None:
+        normalized_sync_mode = normalize_multi_gpu_sync_mode(multi_gpu_sync_mode)
         self.validate_capabilities(
             algo_type=algo_type,
+            learner_cls=learner_cls,
             learner_kwargs=learner_kwargs,
             num_gpus=num_gpus,
+            sync_mode=normalized_sync_mode,
         )
         super().__init__(learner=learner, env_name=env_name, algo_type=algo_type, **kwargs)
         self.num_gpus = num_gpus
@@ -517,7 +625,7 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
         self._learner_cls = learner_cls
         self._learner_kwargs = learner_kwargs
         self.distributed_backend = distributed_backend
-        self.multi_gpu_sync_mode = normalize_multi_gpu_sync_mode(multi_gpu_sync_mode)
+        self.multi_gpu_sync_mode = normalized_sync_mode
         self.multi_gpu_sync_interval = normalize_multi_gpu_sync_interval(
             int(multi_gpu_sync_interval)
         )
@@ -610,6 +718,9 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
             )
 
         metrics_queue = _SPAWN_CTX.Queue(maxsize=100)
+        shared_obs_normalizer_stats = None
+        if self.obs_normalization:
+            shared_obs_normalizer_stats = SharedObsNormStats(_SPAWN_CTX)
         collector_pack_request_queues = [_SPAWN_CTX.Queue(maxsize=2) for _ in range(self.num_gpus)]
         collector_pack_ready_queues = [_SPAWN_CTX.Queue(maxsize=2) for _ in range(self.num_gpus)]
         sample_count = self.batch_size * self.updates_per_step
@@ -640,8 +751,8 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
             "collection_ready_queue": collection_ready_queue,
             "trainer_done_queue": trainer_done_queue,
             "env_steps_per_sync": self.env_steps_per_sync,
-            "obs_normalization": False,
-            "shared_obs_normalizer_stats": None,
+            "obs_normalization": self.obs_normalization,
+            "shared_obs_normalizer_stats": shared_obs_normalizer_stats,
             "sim_backend": self.sim_backend,
             "env_cfg_override": self.env_cfg_override,
             "obs_dim": self.obs_dim,
@@ -685,6 +796,8 @@ class MultiGPUOffPolicyRunner(OffPolicyRunner):
             "multi_gpu_sync_mode": self.multi_gpu_sync_mode,
             "multi_gpu_sync_interval": self.multi_gpu_sync_interval,
             "algo_type": self.algo_type,
+            "obs_normalization": self.obs_normalization,
+            "shared_obs_normalizer_stats": shared_obs_normalizer_stats,
         }
 
         try:

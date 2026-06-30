@@ -1198,6 +1198,8 @@ def test_build_appo_runner_kwargs_forwards_sim_backend():
     assert runner_kwargs["collector_device"] == "cpu"
     assert runner_kwargs["num_envs"] == cfg.algo.num_envs
     assert runner_kwargs["steps_per_env"] == cfg.algo.steps_per_env
+    assert "num_workers" not in runner_kwargs
+    assert "num_collectors" not in runner_kwargs
     assert runner_kwargs["env_cfg_overrides"]["reward_config"]["scales"] == {}
 
 
@@ -2427,16 +2429,17 @@ def test_offpolicy_g1_rough_terrain_task_composes() -> None:
     assert cfg.training.sim_backend == "mujoco"
 
 
-def test_offpolicy_flashsac_rejects_multi_gpu():
+def test_offpolicy_flashsac_multi_gpu_requires_cuda_device():
     cfg = _offpolicy_cfg(
         [
             "algo=flashsac",
             "task=flashsac/g1_walk_flat/mujoco",
             "training.num_gpus=2",
+            "training.device=cpu",
         ]
     )
 
-    with pytest.raises(ValueError, match="Only SAC supports training.num_gpus > 1"):
+    with pytest.raises(ValueError, match="requires a CUDA device"):
         _offpolicy().build_runner("flashsac", cfg)
 
 
@@ -2447,7 +2450,6 @@ def test_offpolicy_sac_multi_gpu_requires_cuda_device():
             "task=sac/g1_walk_flat/mujoco",
             "training.num_gpus=2",
             "training.device=cpu",
-            "algo.obs_normalization=false",
         ]
     )
 
@@ -2463,7 +2465,6 @@ def test_offpolicy_sac_multi_gpu_requires_cuda_even_with_explicit_symmetry_disab
             "training.num_gpus=2",
             "training.device=cpu",
             "algo.use_symmetry=false",
-            "algo.obs_normalization=false",
         ]
     )
 

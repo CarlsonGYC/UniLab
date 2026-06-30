@@ -11,10 +11,12 @@ The off-policy runner decouples CPU simulation from GPU learning through shared
 memory: a collector subprocess fills a CPU-resident replay buffer while the
 learner trains on the GPU.
 
-SAC is also the currently validated replay-buffer multi-GPU algorithm. Enable it
-with `training.num_gpus > 1`; the host side packs and distributes batches in
-parallel, while the GPU learners default to delayed parameter averaging via
-`training.multi_gpu_sync_mode=local_sgd`. See
+The default FastSAC learner is also the currently validated replay-buffer
+multi-GPU SAC implementation. Enable it with `training.num_gpus > 1`; the host
+side packs and distributes batches in parallel, while the GPU learners default
+to delayed parameter averaging via `training.multi_gpu_sync_mode=local_sgd`.
+Custom SAC runtimes must explicitly declare the distributed learner contract
+before they can use this path. See
 {doc}`../1-training/4-multi_gpu` for the full command, strict-sync fallback, and
 constraints.
 
@@ -30,7 +32,6 @@ Two-GPU MuJoCo example:
 ```bash
 CUDA_VISIBLE_DEVICES=0,7 uv run train --algo sac --task g1_walk_flat --sim mujoco \
   training.num_gpus=2 \
-  algo.obs_normalization=false \
   algo.use_symmetry=false
 ```
 
@@ -46,13 +47,14 @@ playback video. See {doc}`/en/1-getting_started/3-evaluation_and_playback`.
   runs, the global update batch is `algo.batch_size * training.num_gpus`.
 - `algo.max_iterations=500`
 - `training.use_amp=true` in the shared off-policy config
-- Multi-GPU SAC uses `training.num_gpus=<N>`; this validation round requires
-  `algo.obs_normalization=false` and does not support `algo.use_symmetry=true`.
+- Multi-GPU SAC uses `training.num_gpus=<N>`; `algo.use_symmetry=true` is not
+  supported yet.
 - Multi-GPU SAC defaults to `training.multi_gpu_sync_mode=local_sgd` and
   `training.multi_gpu_sync_interval=1`.
 
-The current runner path in `scripts/train_offpolicy.py` requires synchronized
-collection; `training.no_sync_collection=true` is rejected by the script.
+Single-GPU SAC and TD3 can run the off-policy double-buffer path with
+`training.no_sync_collection=true`. Multi-GPU SAC and FlashSAC-B still require
+synchronized collection.
 
 ```bash
 uv run train --algo sac --task g1_walk_flat --sim mujoco \

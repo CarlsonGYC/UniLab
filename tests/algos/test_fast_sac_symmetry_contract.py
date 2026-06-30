@@ -137,7 +137,64 @@ def test_fast_sac_learner_exposes_multi_gpu_initial_sync_contract():
     learner.sync_initial_parameters(src=0)
 
 
+def test_fast_sac_obs_normalization_uses_global_distributed_moments(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
+
+    learner = FastSACLearner(
+        obs_dim=2,
+        action_dim=1,
+        critic_obs_dim=3,
+        device="cpu",
+        actor_hidden_dim=8,
+        critic_hidden_dim=8,
+        num_atoms=3,
+        num_q_networks=2,
+        use_layer_norm=False,
+        use_autotune=False,
+        obs_normalization=True,
+        world_size=2,
+    )
+
+    monkeypatch.setattr(learner_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(learner_module.dist, "is_initialized", lambda: True)
+
+    def fake_all_reduce(tensor, op=None):
+        del op
+        remote_moments = torch.tensor([12.0, 16.0, 74.0, 130.0, 2.0])
+        tensor.add_(remote_moments)
+
+    monkeypatch.setattr(learner_module.dist, "all_reduce", fake_all_reduce)
+
+    learner.normalize_obs(torch.tensor([[1.0, 3.0], [3.0, 5.0]]), update=True)
+
+    torch.testing.assert_close(learner.obs_normalizer.mean, torch.tensor([4.0, 6.0]))
+    torch.testing.assert_close(
+        learner.obs_normalizer.std,
+        torch.full((2,), 5.0**0.5),
+    )
+    assert int(learner.obs_normalizer.count.item()) == 4
+
+    restored = FastSACLearner(
+        obs_dim=2,
+        action_dim=1,
+        critic_obs_dim=3,
+        device="cpu",
+        actor_hidden_dim=8,
+        critic_hidden_dim=8,
+        num_atoms=3,
+        num_q_networks=2,
+        use_layer_norm=False,
+        use_autotune=False,
+        obs_normalization=True,
+    )
+    restored.load_state_dict(learner.get_state_dict())
+    torch.testing.assert_close(restored.obs_normalizer.mean, learner.obs_normalizer.mean)
+
+
 def test_multi_gpu_offpolicy_runner_rejects_sac_symmetry_capability():
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
     from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
 
     with pytest.raises(
@@ -146,31 +203,106 @@ def test_multi_gpu_offpolicy_runner_rejects_sac_symmetry_capability():
     ):
         MultiGPUOffPolicyRunner.validate_capabilities(
             algo_type="sac",
+            learner_cls=FastSACLearner,
             learner_kwargs={"use_symmetry": True},
             num_gpus=2,
         )
 
 
 @pytest.mark.parametrize(
-    ("algo_type", "learner_kwargs", "num_gpus"),
+    ("learner_kwargs", "num_gpus"),
     [
-        ("sac", {"use_symmetry": False}, 2),
-        ("sac", {"use_symmetry": True}, 1),
-        ("td3", {"use_symmetry": True}, 2),
+        ({"use_symmetry": False}, 2),
+        ({"use_symmetry": True}, 1),
     ],
 )
 def test_multi_gpu_offpolicy_runner_allows_supported_capabilities(
-    algo_type: str,
     learner_kwargs: dict[str, bool],
     num_gpus: int,
 ):
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
     from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
 
     MultiGPUOffPolicyRunner.validate_capabilities(
-        algo_type=algo_type,
+        algo_type="sac",
+        learner_cls=FastSACLearner,
         learner_kwargs=learner_kwargs,
         num_gpus=num_gpus,
     )
+
+
+def test_multi_gpu_offpolicy_runner_rejects_unsupported_learner_capability():
+    from unilab.algos.torch.fast_td3.learner import FastTD3Learner
+    from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
+
+    with pytest.raises(ValueError, match="FastTD3Learner.*does not support training.num_gpus"):
+        MultiGPUOffPolicyRunner.validate_capabilities(
+            algo_type="td3",
+            learner_cls=FastTD3Learner,
+            learner_kwargs={},
+            num_gpus=2,
+        )
+
+
+def test_multi_gpu_offpolicy_runner_rejects_unsupported_sync_mode():
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
+    from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
+
+    with pytest.raises(ValueError, match="training.multi_gpu_sync_mode must be one of"):
+        MultiGPUOffPolicyRunner.validate_capabilities(
+            algo_type="sac",
+            learner_cls=FastSACLearner,
+            learner_kwargs={"use_symmetry": False},
+            num_gpus=2,
+            sync_mode="bogus",
+        )
+
+
+def test_multi_gpu_offpolicy_runner_normalizes_sync_mode_before_capability_check():
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
+    from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
+
+    MultiGPUOffPolicyRunner.validate_capabilities(
+        algo_type="sac",
+        learner_cls=FastSACLearner,
+        learner_kwargs={"use_symmetry": False},
+        num_gpus=2,
+        sync_mode="LOCAL_SGD",
+    )
+
+
+def test_multi_gpu_offpolicy_runner_requires_direct_learner_opt_in():
+    from unilab.algos.torch.fast_sac.learner import FastSACLearner
+    from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
+
+    class CustomSAC(FastSACLearner):
+        pass
+
+    with pytest.raises(ValueError, match="CustomSAC.*does not support training.num_gpus"):
+        MultiGPUOffPolicyRunner.validate_capabilities(
+            algo_type="custom_sac",
+            learner_cls=CustomSAC,
+            learner_kwargs={"use_symmetry": False},
+            num_gpus=2,
+        )
+
+
+def test_multi_gpu_offpolicy_runner_rejects_missing_distributed_hooks_before_spawn():
+    from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
+
+    class IncompleteLearner:
+        supports_multi_gpu = True
+        supports_multi_gpu_symmetry = False
+        supported_multi_gpu_sync_modes = frozenset({"local_sgd"})
+
+    with pytest.raises(ValueError, match="IncompleteLearner.*sync_initial_parameters"):
+        MultiGPUOffPolicyRunner.validate_capabilities(
+            algo_type="incomplete",
+            learner_cls=IncompleteLearner,
+            learner_kwargs={},
+            num_gpus=2,
+            sync_mode="local_sgd",
+        )
 
 
 def test_fast_sac_local_sgd_skips_per_update_gradient_all_reduce(

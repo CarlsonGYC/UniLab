@@ -178,11 +178,8 @@ def build_runner(algo_name: str, cfg: DictConfig):
     num_gpus = int(getattr(cfg.training, "num_gpus", 1))
     multi_gpu_sync_mode = str(getattr(cfg.training, "multi_gpu_sync_mode", "local_sgd"))
     multi_gpu_sync_interval = int(getattr(cfg.training, "multi_gpu_sync_interval", 1))
-    if num_gpus > 1 and algo_name != "sac":
-        raise ValueError("Only SAC supports training.num_gpus > 1 in this validation round")
 
-    if cfg.training.no_sync_collection:
-        raise ValueError("cpu_pinned_double_buffer requires synchronized collection")
+    sync_collection = not bool(cfg.training.no_sync_collection)
 
     if algo_name == "sac":
         from unilab.algos.torch.fast_sac.learner import FastSACLearner
@@ -265,22 +262,31 @@ def build_runner(algo_name: str, cfg: DictConfig):
             "use_amp": cfg.training.use_amp,
             "amp_dtype": cfg.algo.algo_params.amp_dtype,
             "use_compile": cfg.algo.algo_params.use_compile,
+            "obs_normalization": cfg.algo.obs_normalization,
             "use_symmetry": cfg.algo.use_symmetry,
             "symmetry_augmentation": _symmetry_aug,
             "critic_obs_dim": _critic_dim,
             **_learner_extra_kwargs,
         }
-        _learner = _learner_cls(device=_device, **_learner_kwargs)
 
         if num_gpus > 1:
+            from unilab.algos.torch.offpolicy.distributed import (
+                validate_distributed_learner_capability,
+            )
             from unilab.algos.torch.offpolicy.multi_gpu_runner import MultiGPUOffPolicyRunner
 
-            if cfg.algo.obs_normalization:
-                raise ValueError(
-                    "SAC multi-GPU validation currently requires algo.obs_normalization=false"
-                )
             if not str(_device).startswith("cuda"):
-                raise ValueError("SAC multi-GPU training requires a CUDA device")
+                raise ValueError(f"{_algo_type} multi-GPU training requires a CUDA device")
+            if not sync_collection:
+                raise ValueError("Multi-GPU off-policy replay requires synchronized collection")
+            validate_distributed_learner_capability(
+                algo_type=_algo_type,
+                learner_cls=_learner_cls,
+                learner_kwargs=_learner_kwargs,
+                num_gpus=num_gpus,
+                sync_mode=multi_gpu_sync_mode,
+            )
+            _learner = _learner_cls(device=_device, **_learner_kwargs)
             return MultiGPUOffPolicyRunner(
                 learner=_learner,
                 env_name=cfg.training.task_name,
@@ -297,12 +303,12 @@ def build_runner(algo_name: str, cfg: DictConfig):
                 learning_starts=cfg.algo.learning_starts,
                 updates_per_step=cfg.algo.updates_per_step,
                 policy_frequency=cfg.algo.policy_frequency,
-                sync_collection=True,
+                sync_collection=sync_collection,
                 env_steps_per_sync=cfg.training.env_steps_per_sync,
                 device=_device,
                 actor_hidden_dim=cfg.algo.actor_hidden_dim,
                 use_layer_norm=cfg.algo.use_layer_norm,
-                obs_normalization=False,
+                obs_normalization=cfg.algo.obs_normalization,
                 sim_backend=cfg.training.sim_backend,
                 env_cfg_override=env_cfg_override,
                 actor_kwargs=_actor_kwargs,
@@ -314,6 +320,7 @@ def build_runner(algo_name: str, cfg: DictConfig):
                 nan_guard_cfg=_nan_guard_cfg,
             )
 
+        _learner = _learner_cls(device=_device, **_learner_kwargs)
         return DoubleBufferOffPolicyRunner(
             learner=_learner,
             env_name=cfg.training.task_name,
@@ -324,7 +331,7 @@ def build_runner(algo_name: str, cfg: DictConfig):
             learning_starts=cfg.algo.learning_starts,
             updates_per_step=cfg.algo.updates_per_step,
             policy_frequency=cfg.algo.policy_frequency,
-            sync_collection=True,
+            sync_collection=sync_collection,
             env_steps_per_sync=cfg.training.env_steps_per_sync,
             device=_device,
             actor_hidden_dim=cfg.algo.actor_hidden_dim,
@@ -346,11 +353,21 @@ def build_runner(algo_name: str, cfg: DictConfig):
     if algo_name == "td3":
         from unilab.algos.torch.common.device import get_env_dims
         from unilab.algos.torch.fast_td3.learner import FastTD3Learner
+        from unilab.algos.torch.offpolicy.distributed import (
+            validate_distributed_learner_capability,
+        )
         from unilab.algos.torch.offpolicy.double_buffer_runner import (
             DoubleBufferOffPolicyRunner,
         )
         from unilab.utils.device import get_default_device
 
+        validate_distributed_learner_capability(
+            learner_cls=FastTD3Learner,
+            algo_type="td3",
+            learner_kwargs={},
+            num_gpus=num_gpus,
+            sync_mode=multi_gpu_sync_mode,
+        )
         _device = cfg.training.device or get_default_device()
         _obs_dim, _action_dim, _critic_dim = get_env_dims(
             cfg.training.task_name,
@@ -401,7 +418,7 @@ def build_runner(algo_name: str, cfg: DictConfig):
             learning_starts=cfg.algo.learning_starts,
             updates_per_step=cfg.algo.updates_per_step,
             policy_frequency=cfg.algo.policy_frequency,
-            sync_collection=True,
+            sync_collection=sync_collection,
             env_steps_per_sync=cfg.training.env_steps_per_sync,
             actor_hidden_dim=cfg.algo.actor_hidden_dim,
             use_layer_norm=False,

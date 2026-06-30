@@ -347,9 +347,9 @@ class HoraAPPORunner(APPORunner):
                     f"[yellow]Warning: Timeout waiting for data at iteration {iteration}[/]"
                 )
                 continue
+            wait_time = time.time() - wait_start
 
             available_on_arrive = rollout_ring_buffer.available()
-            wait_time = time.time() - wait_start
 
             num_new = rollout_ring_buffer.available()
             learner_incremental_h2d_time = 0.0
@@ -361,7 +361,9 @@ class HoraAPPORunner(APPORunner):
 
             self._drain_metrics(metrics_queue, reward_history, latest_reward_components, logger)
 
+            replay_sample_start = time.perf_counter()
             combined = staging_pool.batch()
+            learner_replay_sample_time = time.perf_counter() - replay_sample_start
 
             train_start = time.time()
             learner.process_batch(combined)
@@ -393,12 +395,14 @@ class HoraAPPORunner(APPORunner):
                 reward=mean_reward,
                 reward_components=latest_reward_components,
                 train_time=train_time,
-                wait_time=wait_time,
+                collector_wait_time=wait_time,
+                learner_replay_sample_time=learner_replay_sample_time,
                 learner_incremental_h2d_time=learner_incremental_h2d_time,
                 weight_sync_time=weight_sync_time,
                 iteration_time=iteration_time,
                 extra_info={
                     "throughput_steps": num_new * env_steps_per_sync,
+                    "collector_active_steps_per_sec": logger._collector_active_steps_per_sec,
                 },
             )
 

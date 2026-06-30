@@ -119,7 +119,7 @@ def test_offpolicy_training_terminal_refresh_uses_single_low_frequency_trigger(m
 
     logger = OffPolicyLogger(log_backend="none", refresh_per_second=4)
     logger.start()
-    logger.log_step(iteration=1, train_time=0.01, wait_time=0.0)
+    logger.log_step(iteration=1, train_time=0.01, collector_wait_time=0.0)
     assert update_refresh_values == [True]
 
     logger.log_collector(total_steps=128, buffer_size=128, mean_reward=2.0)
@@ -128,7 +128,7 @@ def test_offpolicy_training_terminal_refresh_uses_single_low_frequency_trigger(m
     assert update_refresh_values == [True]
 
     now += 0.3
-    logger.log_step(iteration=2, train_time=0.01, wait_time=0.0)
+    logger.log_step(iteration=2, train_time=0.01, collector_wait_time=0.0)
     assert update_refresh_values == [True, True]
 
     logger.log_status("[red]ERROR: Collector died[/]")
@@ -186,7 +186,7 @@ def test_offpolicy_logger_terminal_timing_labels_include_wall_clock_and_distribu
         metrics={"qf_loss": 0.1},
         reward=1.0,
         train_time=0.5,
-        wait_time=1.0,
+        collector_wait_time=1.0,
         learner_incremental_h2d_time=0.01,
         weight_sync_time=0.03,
         iteration_time=1.6,
@@ -208,10 +208,12 @@ def test_offpolicy_logger_terminal_timing_labels_include_wall_clock_and_distribu
 
     assert "Replay Wait" not in output
     assert "H2D Copy" in output
-    assert "Param Sync (in Train)" in output
+    assert "Replay Batch Wait" not in output
+    assert "Replay Sample" in output
+    assert "Param Sync" in output
     assert "Iter Wall" in output
     assert "Unaccounted" not in output
-    assert "Other" not in output
+    assert "Other Loop" not in output
     assert "GPUs" in output
     assert "Sync Mode" in output
     assert "local_sgd" in output
@@ -236,7 +238,7 @@ def test_offpolicy_logger_terminal_shows_replay_rows_when_symmetry_expands_batch
         iteration=1,
         metrics={"qf_loss": 0.1},
         train_time=0.5,
-        wait_time=0.1,
+        collector_wait_time=0.1,
         iteration_time=1.0,
         extra_info={
             "throughput_steps": 4,
@@ -255,6 +257,9 @@ def test_offpolicy_logger_terminal_shows_replay_rows_when_symmetry_expands_batch
     assert "Replay/Iter" in output
     assert "Samples/Iter" in output
     assert "Samples/s" in output
+    assert "Rank Barrier" not in output
+    assert "Param Sync" not in output
+    assert "Other Loop" not in output
 
     logger.close()
 
@@ -480,13 +485,14 @@ def test_offpolicy_logger_logs_wait_and_iter_throughput(monkeypatch):
         iteration=1,
         metrics={},
         train_time=0.75,
-        wait_time=10.0,
+        collector_wait_time=10.0,
         learner_incremental_h2d_time=0.02,
         learner_param_sync_time=0.04,
         weight_sync_time=0.05,
         iteration_time=10.9,
         extra_info={
             "throughput_steps": 8,
+            "collector_active_steps_per_sec": 1234.5,
             "world_size": 2,
             "batch_size_per_rank": 8,
             "effective_batch_size": 16,
@@ -497,18 +503,23 @@ def test_offpolicy_logger_logs_wait_and_iter_throughput(monkeypatch):
 
     payload, step = fake_wandb.log_calls[-1]
     assert step == 1
-    assert payload["timing/learner_wait_ms"] == 10_000.0
+    assert payload["timing/learner_collector_wait_ms"] == 10_000.0
     assert "timing/learner_collect_ms" not in payload
     assert "timing/learner_replay_wait_ms" not in payload
     assert payload["timing/learner_incremental_h2d_ms"] == 20.0
-    assert "timing/learner_replay_sample_ms" not in payload
+    assert payload["timing/learner_replay_sample_ms"] == 0.0
     assert payload["timing/learner_train_ms"] == 750.0
     assert payload["timing/learner_param_sync_ms"] == 40.0
     assert payload["timing/learner_weight_sync_ms"] == 50.0
-    assert payload["perf/learner_pipeline_ms"] == pytest.approx(820.0)
+    assert payload["timing/learner_other_ms"] == pytest.approx(40.0)
+    assert payload["perf/learner_pipeline_ms"] == pytest.approx(860.0)
     assert payload["perf/iter_ms"] == pytest.approx(10_900.0)
     assert "perf/iter_unaccounted_ms" not in payload
+    assert payload["perf/learner_train_pct"] == pytest.approx(0.75 / 10.9 * 100)
+    assert payload["perf/learner_other_pct"] == pytest.approx(0.04 / 10.9 * 100)
+    assert payload["perf/learner_accounted_pct"] == pytest.approx(10.86 / 10.9 * 100)
     assert payload["perf/steps_per_sec"] == pytest.approx(8.0 / 10.9)
+    assert payload["perf/collector_active_steps_per_sec"] == pytest.approx(1234.5)
     assert payload["perf/effective_samples_per_sec"] == pytest.approx(32.0 / 10.9)
     for key in (
         "axis/iteration",
@@ -568,13 +579,14 @@ def test_offpolicy_logger_tensorboard_logs_wall_clock_without_axis_or_distribute
         iteration=5,
         metrics={},
         train_time=0.7,
-        wait_time=1.0,
+        collector_wait_time=1.0,
         learner_incremental_h2d_time=0.05,
         learner_param_sync_time=0.02,
         weight_sync_time=0.1,
         iteration_time=1.95,
         extra_info={
             "throughput_steps": 16,
+            "collector_active_steps_per_sec": 4321.0,
             "world_size": 2,
             "batch_size_per_rank": 16,
             "effective_batch_size": 32,
@@ -584,13 +596,17 @@ def test_offpolicy_logger_tensorboard_logs_wall_clock_without_axis_or_distribute
     )
 
     scalars = {tag: value for tag, value, _ in tb_writer.scalars}
-    assert scalars["timing/learner_wait_ms"] == pytest.approx(1_000.0)
+    assert scalars["timing/learner_collector_wait_ms"] == pytest.approx(1_000.0)
     assert "timing/learner_replay_wait_ms" not in scalars
     assert scalars["timing/learner_incremental_h2d_ms"] == pytest.approx(50.0)
-    assert "timing/learner_replay_sample_ms" not in scalars
+    assert scalars["timing/learner_replay_sample_ms"] == pytest.approx(0.0)
     assert scalars["timing/learner_param_sync_ms"] == pytest.approx(20.0)
-    assert scalars["perf/learner_pipeline_ms"] == pytest.approx(850.0)
+    assert scalars["timing/learner_other_ms"] == pytest.approx(80.0)
+    assert scalars["perf/learner_pipeline_ms"] == pytest.approx(870.0)
     assert scalars["perf/iter_ms"] == pytest.approx(1_950.0)
+    assert scalars["perf/learner_train_pct"] == pytest.approx(0.7 / 1.95 * 100)
+    assert scalars["perf/learner_other_pct"] == pytest.approx(0.08 / 1.95 * 100)
+    assert scalars["perf/collector_active_steps_per_sec"] == pytest.approx(4321.0)
     assert scalars["perf/effective_samples_per_sec"] == pytest.approx(64.0 / 1.95)
     for key in (
         "axis/iteration",
@@ -618,7 +634,7 @@ def test_offpolicy_logger_omits_param_sync_scalar_for_single_gpu_without_sync():
         iteration=5,
         metrics={},
         train_time=0.7,
-        wait_time=0.1,
+        collector_wait_time=0.1,
         learner_param_sync_time=0.0,
         iteration_time=0.9,
         extra_info={
@@ -678,7 +694,7 @@ def test_offpolicy_logger_omits_iteration_extra_fields_when_not_supplied(monkeyp
         iteration=1,
         metrics={},
         train_time=0.75,
-        wait_time=1.0,
+        collector_wait_time=1.0,
         learner_incremental_h2d_time=0.02,
         weight_sync_time=0.05,
     )

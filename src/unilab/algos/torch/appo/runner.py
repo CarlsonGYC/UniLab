@@ -57,13 +57,11 @@ class APPORunner(AsyncRunner):
         sim_backend: str = "mujoco",
         num_envs: int = 1024,
         steps_per_env: int = 24,
-        num_workers: int = 1,  # kept for API compat, but only 1 collector used
         replay_queue_size: int = 3,
         seed: int | None = None,
         resume_path: str | None = None,
         nan_guard_cfg: NanGuardCfg | None = None,
     ):
-        del num_workers
         super().__init__(
             env_name=env_name,
             env_cfg_overrides=env_cfg_overrides,
@@ -357,13 +355,13 @@ class APPORunner(AsyncRunner):
                     f"[yellow]Warning: Timeout waiting for data at iteration {iteration}[/]"
                 )
                 continue
+            wait_time = time.time() - wait_start
 
             if not logger_started:
                 logger.start(status="Training")
                 logger_started = True
 
             available_on_arrive = rollout_ring_buffer.available()
-            wait_time = time.time() - wait_start
 
             # Drain ALL available slots into the staging pool in one pass.
             # This keeps the GPU busy: if the collector produced 3 rollouts while
@@ -379,7 +377,9 @@ class APPORunner(AsyncRunner):
 
             self._drain_metrics(metrics_queue, reward_history, latest_reward_components, logger)
 
+            replay_sample_start = time.perf_counter()
             combined = staging_pool.batch()
+            learner_replay_sample_time = time.perf_counter() - replay_sample_start
 
             train_start = time.time()
             learner.process_batch(combined)
@@ -412,12 +412,14 @@ class APPORunner(AsyncRunner):
                 reward=mean_reward,
                 reward_components=latest_reward_components,
                 train_time=train_time,
-                wait_time=wait_time,
+                collector_wait_time=wait_time,
+                learner_replay_sample_time=learner_replay_sample_time,
                 learner_incremental_h2d_time=learner_incremental_h2d_time,
                 weight_sync_time=weight_sync_time,
                 iteration_time=iteration_time,
                 extra_info={
                     "throughput_steps": num_new * env_steps_per_sync,
+                    "collector_active_steps_per_sec": logger._collector_active_steps_per_sec,
                 },
             )
 
@@ -470,6 +472,12 @@ class APPORunner(AsyncRunner):
 
                 if "collector_timing_ms" in m:
                     logger.update_collector_timing(m["collector_timing_ms"])
+
+                collector_active_steps_per_sec = m.get("collector_active_steps_per_sec")
+                if collector_active_steps_per_sec is not None:
+                    logger.update_collector_active_steps_per_sec(
+                        float(collector_active_steps_per_sec)
+                    )
 
                 if "timeout_rate" in m or "terminated_rate" in m:
                     logger.update_done_rates(
