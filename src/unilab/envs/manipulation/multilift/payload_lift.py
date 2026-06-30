@@ -102,6 +102,14 @@ class MultiliftHoverCfg(EnvCfg):
     ctrl_dt: float = 5.0 / 500.0  # decimation 5 -> 100 Hz outer loop
     max_episode_seconds: float = 15.0
     base_name: str = _PAYLOAD_NAME
+    control_torch_threads: int = (
+        1  # torch CPU threads for the control stack; 1 is fastest (0 = leave default)
+    )
+    # device for the PX4/CTBR control stack. Benchmarked crossover (16-core CPU / RTX 4080, 512-env
+    # MuJoCo): "cpu" is faster for num_envs <= ~1024 (per-substep H2D/D2H overhead dominates the small
+    # control batch); "cuda" is ~14% faster at num_envs >= 2048 (control batch large enough to amortize
+    # transfer, and single-threaded CPU control becomes the bottleneck). Re-benchmark on target hardware.
+    control_device: str = "cpu"
     # scene geometry (must match scene.xml)
     num_ropes: int = _NUM_ROPES
     rope_length: float = 1.0
@@ -233,6 +241,11 @@ class MultiliftHoverEnv(NpEnv):
             add_body_sensors=True,
         )
         super().__init__(cfg, backend, num_envs)
+        # The per-substep PX4/CTBR control stack is small batched torch CPU ops (num_envs*nd rows);
+        # multi-threading them just adds sync overhead and contends with MuJoCo's own C++ thread pool.
+        # Single-threaded torch here is ~25-30% faster end-to-end (MuJoCo physics threading is unaffected).
+        if cfg.control_torch_threads > 0:
+            torch.set_num_threads(int(cfg.control_torch_threads))
         self._np_dtype = get_global_dtype()
         self.nd = cfg.num_ropes
         self.rows = num_envs * self.nd
@@ -242,15 +255,19 @@ class MultiliftHoverEnv(NpEnv):
         self._drone_ids = self._backend.get_body_ids(_DRONE_NAMES)
         self._payload_ids = self._backend.get_body_ids([_PAYLOAD_NAME])
 
-        # controllers (direct_rl params/rates), torch-cpu
+        # controllers (direct_rl params/rates). control_device="cpu" by default; "cuda" offloads the
+        # per-substep PX4/CTBR math to the GPU (H2D/D2H each substep — benchmark vs the CPU baseline).
+        self._ctrl_device = torch.device(cfg.control_device)
         drone_cfg = DroneControlCfg()
         px4_cfg = PX4ControlCfg()
         px4_cfg.yaw_des = cfg.target_yaw
         support_mass = _DRONE_MASS + cfg.payload_mass / self.nd
         px4_cfg.position.hover_thrust = hover_thrust_for_thrust(support_mass * _G)
-        self.stack = CTBRControlStack(self.rows, dt=cfg.sim_dt, cfg=drone_cfg, device="cpu")
+        self.stack = CTBRControlStack(
+            self.rows, dt=cfg.sim_dt, cfg=drone_cfg, device=self._ctrl_device
+        )
         self.ctrl = PX4PositionAttitudeController(
-            self.rows, dt=cfg.ctrl_dt, cfg=px4_cfg, device="cpu"
+            self.rows, dt=cfg.ctrl_dt, cfg=px4_cfg, device=self._ctrl_device
         )
         self.stack.reset()
         self.ctrl.reset()
@@ -321,7 +338,7 @@ class MultiliftHoverEnv(NpEnv):
     def _reset_controllers(self, env_ids: np.ndarray) -> None:
         cfg = self._cfg
         rows = (np.asarray(env_ids)[:, None] * self.nd + np.arange(self.nd)[None, :]).reshape(-1)
-        rows_t = torch.as_tensor(rows, dtype=torch.long)
+        rows_t = torch.as_tensor(rows, dtype=torch.long, device=self._ctrl_device)
         self.stack.reset(rows_t)
         self.ctrl.reset(rows_t)
         if cfg.randomize_actuators:  # per-drone motor-model DR, ramped late by the DR curriculum
@@ -344,6 +361,12 @@ class MultiliftHoverEnv(NpEnv):
         R = _matrix_from_quat(q)
         return p_l[:, None, :] + torch.bmm(R, rho.unsqueeze(-1)).squeeze(-1).reshape(E, nd, 3)
 
+    def _tc(self, x) -> torch.Tensor:
+        # numpy -> torch on the control device (no-op copy when device is cpu)
+        return torch.as_tensor(
+            np.ascontiguousarray(x), dtype=torch.float32, device=self._ctrl_device
+        )
+
     # ── control: position loop (control rate) ─────────────────────────────────
     def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
         cfg = self._cfg
@@ -359,9 +382,9 @@ class MultiliftHoverEnv(NpEnv):
         raw = np.clip(raw, -1.0, 1.0).astype(np.float32)
         info["preclip_action"] = preclip.astype(np.float32)
         info["raw_action"] = raw
-        a = _t(raw).view(self._num_envs, self.nd, 9)
-        eq_offset = _t(info["eq_offset"])  # [E,nd,3]
-        target = _t(info["target_pos_w"])  # [E,3]
+        a = self._tc(raw).view(self._num_envs, self.nd, 9)
+        eq_offset = self._tc(info["eq_offset"])  # [E,nd,3]
+        target = self._tc(info["target_pos_w"])  # [E,3]
         eq_world = target[:, None, :] + eq_offset
         p_cmd = eq_world + a[..., 0:3] * cfg.pos_range
         if cfg.curriculum_enabled:
@@ -378,18 +401,18 @@ class MultiliftHoverEnv(NpEnv):
         p_sp = p_cmd.reshape(self.rows, 3)
         v_sp = v_cmd.reshape(self.rows, 3)
         a_sp = a_cmd.reshape(self.rows, 3)
-        p = _t(self._backend.get_body_pos_w(self._drone_ids)).reshape(self.rows, 3)
-        v = _t(self._backend.get_body_lin_vel_w(self._drone_ids)).reshape(self.rows, 3)
-        q = _t(self._backend.get_body_quat_w(self._drone_ids)).reshape(self.rows, 4)
+        p = self._tc(self._backend.get_body_pos_w(self._drone_ids)).reshape(self.rows, 3)
+        v = self._tc(self._backend.get_body_lin_vel_w(self._drone_ids)).reshape(self.rows, 3)
+        q = self._tc(self._backend.get_body_quat_w(self._drone_ids)).reshape(self.rows, 4)
         thrust = self.ctrl.update_position(p, v, q, p_sp, v_sp, a_sp)
         self.stack.set_collective_thrust(thrust)
         return np.zeros((self._num_envs, self._backend.num_actuators), dtype=np.float32)
 
     # ── control: attitude + rate loop (sim rate, per substep) ─────────────────
     def _pre_step_wrench(self, backend, ctrl: np.ndarray) -> np.ndarray:
-        q = _t(backend.get_body_quat_w(self._drone_ids)).reshape(self.rows, 4)
-        omega_b = _t(backend.get_body_ang_vel_b(self._drone_ids)).reshape(self.rows, 3)
-        lin = _t(backend.get_body_lin_vel_w(self._drone_ids)).reshape(self.rows, 3)
+        q = self._tc(backend.get_body_quat_w(self._drone_ids)).reshape(self.rows, 4)
+        omega_b = self._tc(backend.get_body_ang_vel_b(self._drone_ids)).reshape(self.rows, 3)
+        lin = self._tc(backend.get_body_lin_vel_w(self._drone_ids)).reshape(self.rows, 3)
         # latch inter-drone collisions at sim rate (500 Hz) — a fast crossing can dip below
         # collision_dist between the 100 Hz control-rate checks (direct_rl substep latch).
         dp = _t(backend.get_body_pos_w(self._drone_ids)).view(self._num_envs, self.nd, 3)
@@ -402,7 +425,7 @@ class MultiliftHoverEnv(NpEnv):
         wrench = torch.cat([F, M], dim=-1).reshape(
             self._num_envs, self.nd * 6
         )  # [E, 6*nd] = [Fx,Fy,Fz,Mx,My,Mz]*nd
-        return wrench.numpy().astype(ctrl.dtype)
+        return wrench.cpu().numpy().astype(ctrl.dtype)
 
     # ── observation + reward + termination ────────────────────────────────────
     def update_state(self, state: NpEnvState) -> NpEnvState:
