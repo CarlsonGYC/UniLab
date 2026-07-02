@@ -47,7 +47,8 @@ _NUM_ROPES = 4
 _DRONE_NAMES = [f"drone{i}" for i in range(_NUM_ROPES)]
 _PAYLOAD_NAME = "payload"
 _ACTION_DIM = 9 * _NUM_ROPES  # PVA per drone
-_OBS_DIM = 18 + 27 * _NUM_ROPES + 1 + 2  # payload 18 + per-drone 27 + diag + mass/radius = 129
+# payload 18 + per-drone (18 state + 9 prev_action + 3 formation-slot err) + diag + mass/radius = 141
+_OBS_DIM = 18 + 30 * _NUM_ROPES + 1 + 2
 _G = 9.80665
 _LINK_TOTAL_LENGTH = 0.20
 _BODY_BOTTOM_OFFSET = 0.012
@@ -61,14 +62,17 @@ class MultiliftRewardConfig:
     scales: dict[str, float] = field(
         default_factory=lambda: {
             "pos": 2.0,
+            "pos_fine": 0.3,  # gentle sub-decimeter pull (no deadband); >~0.5 re-introduces buzz
             "progress": 10.0,
             "att": 0.5,
-            "pl_vel": 0.10,
-            "pl_omega": 0.05,
+            "pl_vel": 0.25,
+            "pl_omega": 0.15,
             "taut": 2.0,
-            "formation": 1.0,
+            "formation": 1.5,
+            "diag": 0.5,  # commanded-diagonal shaping on opposite drone pairs
             "drone_upright": 0.05,
             "drone_omega": 0.005,
+            "drone_vel": 0.03,  # kills settled inter-drone hunting (~1.8 Hz)
             "action": 0.02,
             "action_sat": 0.5,
             "smooth": 0.02,
@@ -80,14 +84,21 @@ class MultiliftRewardConfig:
     )
     crash_penalty: float = 10.0
     sigma_pos: float = 0.3
-    pos_deadband: float = 0.05
+    pos_deadband: float = 0.04
+    sigma_pos_fine: float = 0.10
     sigma_att: float = 0.5
     sigma_form: float = 0.4
+    sigma_diag: float = 0.30
     taut_margin: float = 0.05
     arrival_radius: float = 0.30
     arrival_speed: float = 0.5
     proximity_dist: float = 0.6
     collision_dist: float = 0.4
+    # Bound on the pre-clip overshoot sum fed to the action_sat penalty. Unbounded, a transient
+    # saturation runaway produced per-step rewards of -5e6 and value-loss 2e16, flooring the adaptive
+    # LR for ~12k iterations (2026-06-30 run). 20.0 caps the penalty at -10/step (= crash_penalty)
+    # while leaving the full gradient for |raw| <~ 1.7 per dim.
+    sat_overshoot_clip: float = 20.0
 
 
 @registry.envcfg("MultiliftHover")
@@ -134,7 +145,11 @@ class MultiliftHoverCfg(EnvCfg):
     cur_target_full: float = 0.50
     cur_formation_start: float = 0.05
     cur_formation_full: float = 0.35
+    # vel/acc action channels ramp in continuously over [enable, full] of curriculum progress.
+    # The previous hard gate at 0.40 was the trigger of the 2026-06-30 saturation blow-up: the step
+    # change in the action interface shocked the policy into saturation for ~13k iterations.
     vel_acc_enable_frac: float = 0.40
+    vel_acc_full_frac: float = 0.60
     cur_perturb_start: float = 0.20
     cur_perturb_full: float = 0.65
     reset_pos_offset_max: float = 0.30
@@ -160,15 +175,34 @@ class MultiliftHoverCfg(EnvCfg):
     randomize_actuators: bool = (
         True  # per-drone motor-model DR, ramped late by [cur_dr_start, cur_dr_full]
     )
-    actuator_thrust_range: float = 0.1  # thrust_const * U(1 +/- r)
+    # 0.15 = direct_rl's lumped absorber for hover-throttle error + battery sag + aero (was 0.10)
+    actuator_thrust_range: float = 0.15  # thrust_const * U(1 +/- r)
     actuator_max_speed_range: float = 0.3  # max_motor_speed * U(1 +/- r)
     actuator_tau_range: float = 0.1  # motor time constants * U(1 +/- r)
-    # mid-episode payload push: random world-frame force pulse (one control step, then cleared) on the
-    # payload every push_interval control-steps, ramped in late by [cur_dr_start, cur_dr_full]. Keep this
-    # small: direct_rl used a 3 N pulse; stronger pushes dominated early tracking loss in MuJoCo.
+    # payload CoM offset DR: constant trim moment from an off-center load, resampled per reset
+    randomize_payload_com: bool = True
+    payload_com_range: float = 0.03  # CoM += U(-r, +r) m per axis
+    # mid-episode payload push: wind-like world-frame force on the payload — a target sampled
+    # U(-1,1)*push_max_force every push_resample_s, low-passed with push_filter_tau_s, HELD between
+    # resamples (direct_rl parity; replaces the earlier one-control-step 3 N pulses which integrated
+    # to a negligible ~0.03 N*s impulse). Ramped in late by [cur_dr_start, cur_dr_full].
     push_payload: bool = True
-    push_interval: int = 200  # control steps between pushes (~2 s at 100 Hz)
-    push_max_force: tuple[float, float, float] = (3.0, 3.0, 3.0)  # +/- N per axis
+    push_max_force: tuple[float, float, float] = (1.0, 1.0, 1.0)  # +/- N per axis (held force)
+    push_resample_s: float = 0.5  # hold each sampled push target this long
+    push_filter_tau_s: float = 0.25  # first-order low-pass toward the target
+    # ── latency + sensor-realism DR (sim-to-real; max delays ramped by [cur_dr_start, cur_dr_full]) ──
+    action_delay_steps_max: int = 3  # per-episode action transport delay ~ randint(0, max) @100 Hz
+    obs_delay_steps_max: int = 3  # per-episode observation delay ~ randint(0, max)
+    ctrl_fb_delay_steps_max: int = 2  # (p,v) feedback into the PX4 position loop ~ randint(0, max)
+    # per-step Gaussian sensor noise (vicon-like; also applied to the PX4 position-loop feedback)
+    obs_noise_pos: float = 0.005  # m
+    obs_noise_vel: float = 0.03  # m/s
+    obs_noise_ang: float = 0.02  # rad/s
+    obs_noise_att: float = 0.005  # rotation-matrix entry (~0.3 deg)
+    # per-episode constant observation bias ~ N(0, std) (origin offset / mount misalignment / gyro bias)
+    obs_bias_pos: float = 0.02  # m
+    obs_bias_att: float = 0.026  # rotation-matrix entry (~1.5 deg)
+    obs_bias_ang: float = 0.01  # rad/s
     cur_dr_start: float = 0.60
     cur_dr_full: float = 0.90
     reward_config: MultiliftRewardConfig = field(default_factory=MultiliftRewardConfig)
@@ -301,7 +335,38 @@ class MultiliftHoverEnv(NpEnv):
         # approach that dips below collision_dist between control-rate checks is not missed.
         self._collided = np.zeros(num_envs, dtype=bool)
 
+        # per-channel corruption std vectors matching the obs layout (prev_action/command channels 0)
+        self._obs_noise_std = self._obs_channel_std(
+            cfg.obs_noise_pos, cfg.obs_noise_att, cfg.obs_noise_vel, cfg.obs_noise_ang
+        )
+        self._obs_bias_std = self._obs_channel_std(
+            cfg.obs_bias_pos, cfg.obs_bias_att, 0.0, cfg.obs_bias_ang
+        )
+        # latency DR ring buffers (per-episode integer delays live in info; global write cursor)
+        self._act_ring = np.zeros(
+            (num_envs, cfg.action_delay_steps_max + 1, _ACTION_DIM), np.float32
+        )
+        self._act_idx = 0
+        self._obs_ring = np.zeros((num_envs, cfg.obs_delay_steps_max + 1, _OBS_DIM), np.float32)
+        self._obs_idx = 0
+        fb_k = cfg.ctrl_fb_delay_steps_max + 1
+        self._fb_ring_p = np.zeros((num_envs, fb_k, nd, 3), np.float32)
+        self._fb_ring_v = np.zeros((num_envs, fb_k, nd, 3), np.float32)
+        self._fb_idx = 0
+        self._fb_prime = np.ones(num_envs, dtype=bool)  # fill history from fresh state after reset
+        # held/low-passed payload push state (provider updates it every control step)
+        self._push_force = np.zeros((num_envs, 3), np.float64)
+        self._push_target = np.zeros((num_envs, 3), np.float64)
+        self._push_countdown = np.zeros(num_envs, np.int64)
+
         self._init_domain_randomization(dr_provider or MultiliftDRProvider())
+
+    def _obs_channel_std(self, pos: float, att: float, vel: float, ang: float) -> np.ndarray:
+        """Per-channel std vector for the obs layout; prev_action/diag/mass/const channels get 0."""
+        payload = [pos] * 3 + [att] * 9 + [vel] * 3 + [ang] * 3
+        drone = [pos] * 3 + [att] * 9 + [vel] * 3 + [ang] * 3 + [0.0] * 9 + [pos] * 3
+        extras = [0.0] * 3
+        return np.asarray(payload + drone * self.nd + extras, dtype=np.float32)
 
     # ── properties ────────────────────────────────────────────────────────────
     @property
@@ -367,42 +432,81 @@ class MultiliftHoverEnv(NpEnv):
             np.ascontiguousarray(x), dtype=torch.float32, device=self._ctrl_device
         )
 
+    @staticmethod
+    def _ring_read(ring: np.ndarray, idx: int, delay: np.ndarray) -> np.ndarray:
+        """Per-env delayed read from ring [E, K, ...] at global write cursor ``idx``."""
+        k = ring.shape[1]
+        sel = (idx - np.minimum(delay.astype(np.int64), k - 1)) % k
+        sel = sel.reshape((-1,) + (1,) * (ring.ndim - 1))
+        return np.take_along_axis(ring, sel, axis=1)[:, 0]
+
     # ── control: position loop (control rate) ─────────────────────────────────
     def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
         cfg = self._cfg
         info = state.info
+        E = self._num_envs
         self._collided[:] = False  # reset substep collision latch
-        preclip = np.asarray(actions, dtype=np.float32).reshape(self._num_envs, _ACTION_DIM)
+        # per-episode action transport delay (ring buffer over the raw policy output)
+        commanded = np.asarray(actions, dtype=np.float32).reshape(E, _ACTION_DIM)
+        self._act_idx = (self._act_idx + 1) % self._act_ring.shape[1]
+        self._act_ring[:, self._act_idx] = commanded
+        act_delay = np.asarray(info.get("act_delay", np.zeros(E)), dtype=np.int64).reshape(E)
+        preclip = self._ring_read(self._act_ring, self._act_idx, act_delay)
         clipped = np.clip(preclip, -1.0, 1.0)
         prev_effective = np.asarray(
             info.get("raw_action", np.zeros_like(clipped)), dtype=np.float32
-        ).reshape(self._num_envs, _ACTION_DIM)
+        ).reshape(E, _ACTION_DIM)
         tau = min(max(float(cfg.action_filter_tau), 0.0), 1.0)
         raw = tau * prev_effective + (1.0 - tau) * clipped if tau > 0.0 else clipped
         raw = np.clip(raw, -1.0, 1.0).astype(np.float32)
         info["preclip_action"] = preclip.astype(np.float32)
         info["raw_action"] = raw
-        a = self._tc(raw).view(self._num_envs, self.nd, 9)
+        a = self._tc(raw).view(E, self.nd, 9)
         eq_offset = self._tc(info["eq_offset"])  # [E,nd,3]
         target = self._tc(info["target_pos_w"])  # [E,3]
         eq_world = target[:, None, :] + eq_offset
         p_cmd = eq_world + a[..., 0:3] * cfg.pos_range
+        # vel/acc channels ramp in continuously (a hard gate here shocked the policy into a
+        # 13k-iteration saturation blow-up in the 2026-06-30 run)
         if cfg.curriculum_enabled:
-            va_enabled = self._curriculum_progress() >= cfg.vel_acc_enable_frac
+            va_scale = self._ramp(
+                self._curriculum_progress(), cfg.vel_acc_enable_frac, cfg.vel_acc_full_frac
+            )
         else:
-            va_enabled = not cfg.zero_vel_acc_cmd
-        info["va_enabled"] = np.full((self._num_envs,), float(va_enabled), dtype=np.float32)
-        if va_enabled:
-            v_cmd = a[..., 3:6] * cfg.v_max
-            a_cmd = a[..., 6:9] * cfg.a_max
+            va_scale = 0.0 if cfg.zero_vel_acc_cmd else 1.0
+        info["va_scale"] = np.full((E,), va_scale, dtype=np.float32)
+        if va_scale > 0.0:
+            v_cmd = a[..., 3:6] * (cfg.v_max * va_scale)
+            a_cmd = a[..., 6:9] * (cfg.a_max * va_scale)
         else:
             v_cmd = torch.zeros_like(p_cmd)
             a_cmd = torch.zeros_like(p_cmd)
         p_sp = p_cmd.reshape(self.rows, 3)
         v_sp = v_cmd.reshape(self.rows, 3)
         a_sp = a_cmd.reshape(self.rows, 3)
-        p = self._tc(self._backend.get_body_pos_w(self._drone_ids)).reshape(self.rows, 3)
-        v = self._tc(self._backend.get_body_lin_vel_w(self._drone_ids)).reshape(self.rows, 3)
+        # controller-feedback realism: the PX4 position loop closes on delayed + noisy (p, v)
+        # (EKF2/vicon), not ground truth; attitude/rate feedback stays truth.
+        p_now = np.asarray(self._backend.get_body_pos_w(self._drone_ids), dtype=np.float32)
+        v_now = np.asarray(self._backend.get_body_lin_vel_w(self._drone_ids), dtype=np.float32)
+        p_now = p_now.reshape(E, self.nd, 3)
+        v_now = v_now.reshape(E, self.nd, 3)
+        self._fb_idx = (self._fb_idx + 1) % self._fb_ring_p.shape[1]
+        if self._fb_prime.any():  # freshly-reset envs: fill history with the current state
+            ids = np.flatnonzero(self._fb_prime)
+            self._fb_ring_p[ids] = p_now[ids][:, None]
+            self._fb_ring_v[ids] = v_now[ids][:, None]
+            self._fb_prime[:] = False
+        self._fb_ring_p[:, self._fb_idx] = p_now
+        self._fb_ring_v[:, self._fb_idx] = v_now
+        fb_delay = np.asarray(info.get("fb_delay", np.zeros(E)), dtype=np.int64).reshape(E)
+        p_fb = self._ring_read(self._fb_ring_p, self._fb_idx, fb_delay)
+        v_fb = self._ring_read(self._fb_ring_v, self._fb_idx, fb_delay)
+        if cfg.obs_noise_pos > 0.0:
+            p_fb = p_fb + np.random.randn(*p_fb.shape).astype(np.float32) * cfg.obs_noise_pos
+        if cfg.obs_noise_vel > 0.0:
+            v_fb = v_fb + np.random.randn(*v_fb.shape).astype(np.float32) * cfg.obs_noise_vel
+        p = self._tc(p_fb).reshape(self.rows, 3)
+        v = self._tc(v_fb).reshape(self.rows, 3)
         q = self._tc(self._backend.get_body_quat_w(self._drone_ids)).reshape(self.rows, 4)
         thrust = self.ctrl.update_position(p, v, q, p_sp, v_sp, a_sp)
         self.stack.set_collective_thrust(thrust)
@@ -455,19 +559,32 @@ class MultiliftHoverEnv(NpEnv):
         payload_obs = torch.cat([pp - target, R_l.reshape(E, 9), pl, pw], dim=-1)
         attach = self._attach_points(pp, pq)
         R_d = _matrix_from_quat(dq.reshape(-1, 4)).reshape(E, nd, 9)
-        drone_obs = torch.cat([dp - attach, R_d, dl, do, prev_action.view(E, nd, 9)], dim=-1)
+        rel = dp - pp[:, None, :]
+        slot_err = rel - eq_offset  # per-drone formation-slot error (desired-slot residual)
+        drone_obs = torch.cat(
+            [dp - attach, R_d, dl, do, prev_action.view(E, nd, 9), slot_err], dim=-1
+        )
         mass_ratio = _t(info["mass_obs_factor"]).view(E, 1)
-        obs = torch.cat(
+        obs_t = torch.cat(
             [
                 payload_obs,
-                drone_obs.reshape(E, nd * 27),
+                drone_obs.reshape(E, nd * 30),
                 diag_cmd.view(E, 1),
                 mass_ratio,
                 torch.ones(E, 1),
             ],
             dim=-1,
         )
-        obs = torch.nan_to_num(obs).numpy().astype(self._np_dtype)
+        clean = torch.nan_to_num(obs_t).numpy().astype(np.float32)
+        # sensor realism: clean + per-episode bias + per-step Gaussian noise, then per-env delay
+        bias = np.asarray(info.get("obs_bias", np.zeros((E, _OBS_DIM))), dtype=np.float32).reshape(
+            E, _OBS_DIM
+        )
+        noisy = clean + bias + np.random.randn(E, _OBS_DIM).astype(np.float32) * self._obs_noise_std
+        self._obs_idx = (self._obs_idx + 1) % self._obs_ring.shape[1]
+        self._obs_ring[:, self._obs_idx] = noisy
+        obs_delay = np.asarray(info.get("obs_delay", np.zeros(E)), dtype=np.int64).reshape(E)
+        obs = self._ring_read(self._obs_ring, self._obs_idx, obs_delay).astype(self._np_dtype)
 
         # ── reward ──
         sc = cfg.reward_config.scales
@@ -476,6 +593,9 @@ class MultiliftHoverEnv(NpEnv):
         pos_dist = pos_delta.norm(dim=-1)
         pos_reward_err = (pos_dist - rc.pos_deadband).clamp(min=0.0)
         r_pos = sc["pos"] * torch.exp(-pos_reward_err.pow(2) / rc.sigma_pos**2)
+        # gentle no-deadband fine term: keeps a gradient on the last few cm (the deadbanded coarse
+        # term left a +6.6 cm settled altitude bias reward-invisible) without re-introducing buzz
+        r_pos_fine = sc.get("pos_fine", 0.0) * torch.exp(-pos_dist.pow(2) / rc.sigma_pos_fine**2)
         prev_dist = _t(info["prev_dist"])
         curr_dist = pos_dist
         r_progress = sc["progress"] * (prev_dist - curr_dist)
@@ -488,14 +608,26 @@ class MultiliftHoverEnv(NpEnv):
         d = (dp - attach).norm(dim=-1)
         slack = (self._cable_full_len - rc.taut_margin - d).clamp(min=0.0)
         r_taut = -sc["taut"] * slack.pow(2).sum(-1)
-        rel = dp - pp[:, None, :]
-        form_err2 = (rel - eq_offset).pow(2).sum(-1).mean(-1)
+        form_err2 = slot_err.pow(2).sum(-1).mean(-1)
         r_formation = sc["formation"] * (torch.exp(-form_err2 / rc.sigma_form**2) - 1.0)
+        if nd >= 2:
+            half = nd // 2
+            d_diag = (dp[:, :half, :] - dp[:, half:, :]).norm(dim=-1)
+            diag_err2 = (d_diag - diag_cmd[:, None]).pow(2).mean(-1)
+        else:
+            diag_err2 = torch.zeros(E)
+        # explicit commanded-diagonal shaping on opposite pairs (formation alone under-constrains scale)
+        r_diag = sc.get("diag", 0.0) * (torch.exp(-diag_err2 / rc.sigma_diag**2) - 1.0)
         r_drone_up = sc["drone_upright"] * R_d.reshape(E, nd, 3, 3)[..., 2, 2].sum(-1)
         r_drone_om = -sc["drone_omega"] * do.pow(2).sum(-1).sum(-1)
+        # drone linear-velocity damping: kills settled inter-drone hunting no payload term sees
+        r_drone_vel = -sc.get("drone_vel", 0.0) * dl.pow(2).sum(-1).sum(-1)
         r_action = -sc["action"] * raw_action.pow(2).sum(-1)
         action_overshoot = (preclip_action.abs() - 1.0).clamp(min=0.0).pow(2).sum(-1)
-        r_action_sat = -sc.get("action_sat", 0.0) * action_overshoot
+        # penalty is BOUNDED: unbounded, a saturation transient fed -5e6/step rewards into the critic
+        r_action_sat = -sc.get("action_sat", 0.0) * action_overshoot.clamp(
+            max=rc.sat_overshoot_clip
+        )
         r_smooth = -sc["smooth"] * (raw_action - prev_action).pow(2).sum(-1)
         # 2nd-order (jerk) smoothness: penalizes equal-and-opposite reversals (buzzing) the 1st
         # difference is blind to (direct_rl: r_smooth2).
@@ -516,14 +648,17 @@ class MultiliftHoverEnv(NpEnv):
         r_time = sc["time_bonus"] * time_frac * newly.float()
         reward_t = (
             r_pos
+            + r_pos_fine
             + r_progress
             + r_att
             + r_pl_vel
             + r_pl_omega
             + r_taut
             + r_formation
+            + r_diag
             + r_drone_up
             + r_drone_om
+            + r_drone_vel
             + r_action
             + r_action_sat
             + r_smooth
@@ -562,19 +697,15 @@ class MultiliftHoverEnv(NpEnv):
         info["slack_counter"] = slack_cnt.numpy().astype(np.float32)
         info["prev_prev_action"] = prev_action.numpy().astype(np.float32)  # u_{t-2} <- u_{t-1}
         info["prev_action"] = raw_action.numpy().astype(np.float32)  # u_{t-1} <- u_t
-        if nd >= 2:
-            half = nd // 2
-            d_diag = (dp[:, :half, :] - dp[:, half:, :]).norm(dim=-1)
-            diag_err2 = (d_diag - diag_cmd[:, None]).pow(2).mean(-1)
-        else:
-            diag_err2 = torch.zeros(E)
         info["log"] = {
             "metrics/payload_pos_err_m": float(pos_dist.mean()),
+            "metrics/within_10cm": float((pos_dist < 0.10).float().mean()),
             "metrics/target_offset_m": float((target - _t(self._target_base)).norm(dim=-1).mean()),
             "metrics/cable_d_mean_m": float(d.mean()),
             "metrics/formation_err_m": float(form_err2.sqrt().mean()),
             "metrics/diag_err_m": float(diag_err2.sqrt().mean()),
             "metrics/min_drone_dist_m": float(pdist.amin(dim=(-1, -2)).mean()),
+            "metrics/drone_speed_mps": float(dl.norm(dim=-1).mean()),
             "metrics/reached_frac": float((reached | arrived).float().mean()),
             "metrics/action_jitter": float(
                 (raw_action - 2.0 * prev_action + prev_prev_action).norm(dim=-1).mean()
@@ -584,13 +715,34 @@ class MultiliftHoverEnv(NpEnv):
             "metrics/action_overshoot": float(action_overshoot.mean()),
             "metrics/action_norm": float(raw_action.norm(dim=-1).mean()),
             "metrics/collision_frac": float(collided.float().mean()),  # envs colliding this step
+            "metrics/push_force_norm": float(np.linalg.norm(self._push_force, axis=-1).mean()),
             "curriculum/progress": float(self._curriculum_progress()),
-            "curriculum/va_enabled": float(np.mean(info.get("va_enabled", 0.0))),
+            "curriculum/va_scale": float(np.mean(info.get("va_scale", 0.0))),
+            "termination/nonfinite_frac": float((~finite).float().mean()),
+            "termination/diverged_frac": float(diverged.float().mean()),
+            "termination/tumbled_frac": float(tumbled.float().mean()),
+            "termination/drone_low_frac": float(drone_low.float().mean()),
+            "termination/drone_flip_frac": float(drone_flip.float().mean()),
+            "termination/slack_frac": float(slack_term.float().mean()),
+            "termination/collided_frac": float(collided.float().mean()),
             "Episode_Reward/pos": float(r_pos.mean()),
+            "Episode_Reward/pos_fine": float(r_pos_fine.mean()),
+            "Episode_Reward/progress": float(r_progress.mean()),
+            "Episode_Reward/att": float(r_att.mean()),
+            "Episode_Reward/pl_vel": float(r_pl_vel.mean()),
+            "Episode_Reward/pl_omega": float(r_pl_omega.mean()),
+            "Episode_Reward/taut": float(r_taut.mean()),
+            "Episode_Reward/formation": float(r_formation.mean()),
+            "Episode_Reward/diag": float(r_diag.mean()),
+            "Episode_Reward/drone_upright": float(r_drone_up.mean()),
+            "Episode_Reward/drone_omega": float(r_drone_om.mean()),
+            "Episode_Reward/drone_vel": float(r_drone_vel.mean()),
             "Episode_Reward/action": float(r_action.mean()),
             "Episode_Reward/action_sat": float(r_action_sat.mean()),
             "Episode_Reward/smooth": float(r_smooth.mean()),
             "Episode_Reward/smooth2": float(r_smooth2.mean()),
+            "Episode_Reward/proximity": float(r_prox.mean()),
+            "Episode_Reward/time_bonus": float(r_time.mean()),
         }
         reward = torch.nan_to_num(reward_t).numpy().astype(self._np_dtype)
         terminated = terminated_t.numpy()
@@ -603,7 +755,10 @@ class MultiliftHoverEnv(NpEnv):
     def reset(self, env_indices: np.ndarray):
         obs, info = super().reset(env_indices)
         self._reset_controllers(env_indices)
-        self._collided[np.asarray(env_indices)] = False
+        ids = np.asarray(env_indices)
+        self._collided[ids] = False
+        self._act_ring[ids] = 0.0  # zero action history (matches zeroed prev_action)
+        self._fb_prime[ids] = True  # controller-feedback history refilled on next apply_action
         return obs, info
 
 
@@ -611,28 +766,40 @@ class MultiliftDRProvider(DomainRandomizationProvider):
     """Resets to the taut formation (= default qpos) + curriculum perturbation/target; seeds info."""
 
     def validate(self, env, capabilities: DomainRandomizationCapabilities) -> None:
-        if env._cfg.push_payload and not capabilities.supports_interval_push:
+        if env._cfg.push_payload and not capabilities.supports_interval_body_force:
             raise NotImplementedError(
-                f"{env._backend.backend_type} backend does not support interval payload push; "
+                f"{env._backend.backend_type} backend does not support interval body force; "
                 "set env.push_payload=false"
             )
 
     def build_interval_randomization_plan(
         self, env: MultiliftHoverEnv, step_counter: int
     ) -> IntervalRandomizationPlan | None:
-        # random force pulse on the payload base every push_interval control-steps, ramped late by DR
+        # wind-like held payload force: target ~ U(-1,1)*push_max_force*ramp resampled every
+        # push_resample_s, actual force first-order low-passed toward it; applied every control step
         cfg = env._cfg
-        if not cfg.push_payload or step_counter <= 0 or step_counter % cfg.push_interval != 0:
+        if not cfg.push_payload:
             return None
         ramp = (
             env._ramp(env._curriculum_progress(), cfg.cur_dr_start, cfg.cur_dr_full)
             if cfg.curriculum_enabled
             else 1.0
         )
-        if ramp <= 0.0:
+        if ramp <= 0.0 and not np.any(env._push_force):
             return None
-        force = np.asarray(cfg.push_max_force, dtype=np.float64) * ramp
-        return IntervalRandomizationPlan(push_perturbation_limit=force)
+        resample = env._push_countdown <= 0
+        if np.any(resample):
+            n = int(resample.sum())
+            limit = np.asarray(cfg.push_max_force, dtype=np.float64) * ramp
+            env._push_target[resample] = (np.random.rand(n, 3) * 2.0 - 1.0) * limit
+            env._push_countdown[resample] = max(1, round(cfg.push_resample_s / cfg.ctrl_dt))
+        env._push_countdown -= 1
+        alpha = 1.0 - math.exp(-cfg.ctrl_dt / max(cfg.push_filter_tau_s, 1e-6))
+        env._push_force += alpha * (env._push_target - env._push_force)
+        return IntervalRandomizationPlan(
+            body_ids=np.asarray(env._payload_ids, dtype=np.int32),
+            body_force=env._push_force[:, None, :].copy(),
+        )
 
     def _build_episode_info(
         self,
@@ -657,6 +824,11 @@ class MultiliftDRProvider(DomainRandomizationProvider):
         eq_offset = env.formation_offset(diag)  # [n,nd,3]
         init_err = np.linalg.norm(payload_xyz - target, axis=-1)
         no = cfg.obs_param_noise
+        # per-episode latency draws: max delay ramped in late by the DR curriculum
+        dr = env._ramp(p, cfg.cur_dr_start, cfg.cur_dr_full) if cfg.curriculum_enabled else 1.0
+        act_max = int(round(cfg.action_delay_steps_max * dr))
+        obs_max = int(round(cfg.obs_delay_steps_max * dr))
+        fb_max = int(round(cfg.ctrl_fb_delay_steps_max * dr))
         return {
             "target_pos_w": target.astype(np.float32),
             "diag_cmd": diag.astype(np.float32),
@@ -665,7 +837,7 @@ class MultiliftDRProvider(DomainRandomizationProvider):
             "prev_prev_action": np.zeros((n, _ACTION_DIM), np.float32),
             "preclip_action": np.zeros((n, _ACTION_DIM), np.float32),
             "raw_action": np.zeros((n, _ACTION_DIM), np.float32),
-            "va_enabled": np.zeros((n,), np.float32),
+            "va_scale": np.zeros((n,), np.float32),
             "prev_dist": init_err.astype(np.float32),
             "reached": (init_err < cfg.reward_config.arrival_radius),
             "slack_counter": np.zeros((n,), np.float32),
@@ -673,6 +845,11 @@ class MultiliftDRProvider(DomainRandomizationProvider):
             "mass_obs_factor": (mass_scale * (1.0 + (np.random.rand(n) * 2 - 1) * no)).astype(
                 np.float32
             ),
+            "act_delay": np.random.randint(0, act_max + 1, n).astype(np.int64),
+            "obs_delay": np.random.randint(0, obs_max + 1, n).astype(np.int64),
+            "fb_delay": np.random.randint(0, fb_max + 1, n).astype(np.int64),
+            # per-episode constant observation bias (origin offset / mount misalignment / gyro bias)
+            "obs_bias": (np.random.randn(n, _OBS_DIM) * env._obs_bias_std).astype(np.float32),
         }
 
     def build_reset_plan(self, env: MultiliftHoverEnv, env_ids: np.ndarray) -> ResetPlan:
@@ -689,37 +866,53 @@ class MultiliftDRProvider(DomainRandomizationProvider):
         vel = (np.random.rand(n, 3) * 2 - 1) * (cfg.reset_lin_vel_max * perturb)
         qpos[:, 0:3] += off
         qvel[:, 0:3] = vel
-        # payload MASS+INERTIA DR: scale ONLY the payload body. Inertia tracks mass (I ∝ m for a
+        # payload MASS+INERTIA+CoM DR: scale ONLY the payload body. Inertia tracks mass (I ∝ m for a
         # fixed-geometry payload) so mass/inertia stay self-consistent; randomize_payload_inertia
-        # adds an independent jitter on top for robustness (direct_rl parity).
+        # adds an independent jitter on top; randomize_payload_com shifts the body inertial frame
+        # (constant trim moment from an off-center load).
         randomization = None
         mass_scale = np.ones(n)
-        if cfg.randomize_payload_mass or cfg.randomize_payload_inertia:
+        if cfg.randomize_payload_mass or cfg.randomize_payload_inertia or cfg.randomize_payload_com:
             pbid = int(env._payload_ids[0])
-            base_mass = np.asarray(env._backend.get_body_mass(), dtype=np.float64)  # (nbody,)
-            base_inertia = np.asarray(
-                env._backend.get_body_inertia(), dtype=np.float64
-            )  # (nbody, 3)
-            body_mass = np.broadcast_to(base_mass, (n, base_mass.shape[0])).copy()
-            body_inertia = np.broadcast_to(
-                base_inertia, (n, *base_inertia.shape)
-            ).copy()  # (n, nbody, 3)
-            if cfg.randomize_payload_mass:
-                mass_scale = np.random.uniform(
-                    1.0 - cfg.payload_mass_range, 1.0 + cfg.payload_mass_range, n
+            body_mass = None
+            body_inertia = None
+            body_ipos = None
+            if cfg.randomize_payload_mass or cfg.randomize_payload_inertia:
+                base_mass = np.asarray(env._backend.get_body_mass(), dtype=np.float64)  # (nbody,)
+                base_inertia = np.asarray(
+                    env._backend.get_body_inertia(), dtype=np.float64
+                )  # (nbody, 3)
+                body_mass = np.broadcast_to(base_mass, (n, base_mass.shape[0])).copy()
+                body_inertia = np.broadcast_to(
+                    base_inertia, (n, *base_inertia.shape)
+                ).copy()  # (n, nbody, 3)
+                if cfg.randomize_payload_mass:
+                    mass_scale = np.random.uniform(
+                        1.0 - cfg.payload_mass_range, 1.0 + cfg.payload_mass_range, n
+                    )
+                    body_mass[:, pbid] = base_mass[pbid] * mass_scale
+                    body_inertia[:, pbid, :] = base_inertia[pbid] * mass_scale[:, None]  # I ∝ m
+                if cfg.randomize_payload_inertia:
+                    jit = np.random.uniform(
+                        1.0 - cfg.payload_inertia_range, 1.0 + cfg.payload_inertia_range, n
+                    )
+                    body_inertia[:, pbid, :] *= jit[:, None]
+            if cfg.randomize_payload_com:
+                base_ipos = np.asarray(env._backend.get_body_ipos(), dtype=np.float64)  # (nbody, 3)
+                body_ipos = np.broadcast_to(base_ipos, (n, *base_ipos.shape)).copy()
+                body_ipos[:, pbid, :] += np.random.uniform(
+                    -cfg.payload_com_range, cfg.payload_com_range, (n, 3)
                 )
-                body_mass[:, pbid] = base_mass[pbid] * mass_scale
-                body_inertia[:, pbid, :] = base_inertia[pbid] * mass_scale[:, None]  # I ∝ m
-            if cfg.randomize_payload_inertia:
-                jit = np.random.uniform(
-                    1.0 - cfg.payload_inertia_range, 1.0 + cfg.payload_inertia_range, n
-                )
-                body_inertia[:, pbid, :] *= jit[:, None]
             randomization = ResetRandomizationPayload(
-                body_mass=body_mass.astype(np.float32), body_inertia=body_inertia.astype(np.float32)
+                body_mass=None if body_mass is None else body_mass.astype(np.float32),
+                body_inertia=None if body_inertia is None else body_inertia.astype(np.float32),
+                body_ipos=None if body_ipos is None else body_ipos.astype(np.float32),
             )
         info_updates = self._build_episode_info(env, env_ids, qpos[:, 0:3].copy(), mass_scale)
-        env._reset_controllers(env_ids)
+        # zero the held-push state for the reset envs (fresh episode starts wind-free)
+        env._push_force[env_ids] = 0.0
+        env._push_target[env_ids] = 0.0
+        env._push_countdown[env_ids] = 0
         return ResetPlan(
             env_ids=env_ids,
             qpos=qpos,
@@ -750,16 +943,26 @@ class MultiliftDRProvider(DomainRandomizationProvider):
         payload_obs = torch.cat([pp - target, R_l.reshape(E, 9), pl, pw], dim=-1)
         attach = env._attach_points(pp, pq)
         R_d = _matrix_from_quat(dq.reshape(-1, 4)).reshape(E, nd, 9)
-        drone_obs = torch.cat([dp - attach, R_d, dl, do, torch.zeros(E, nd, 9)], dim=-1)
+        slot_err = (dp - pp[:, None, :]) - eq
+        drone_obs = torch.cat([dp - attach, R_d, dl, do, torch.zeros(E, nd, 9), slot_err], dim=-1)
         obs = torch.cat(
             [
                 payload_obs,
-                drone_obs.reshape(E, nd * 27),
+                drone_obs.reshape(E, nd * 30),
                 diag.view(E, 1),
                 mass.view(E, 1),
                 torch.ones(E, 1),
             ],
             dim=-1,
         )
-        obs = torch.nan_to_num(obs).numpy().astype(get_global_dtype())
-        return {"obs": obs[env_ids]}
+        clean = torch.nan_to_num(obs).numpy().astype(np.float32)[env_ids]
+        # same corruption chain as update_state (bias just drawn for this episode + per-step noise)
+        n = clean.shape[0]
+        noisy = (
+            clean
+            + np.asarray(info_updates["obs_bias"], dtype=np.float32)
+            + np.random.randn(n, _OBS_DIM).astype(np.float32) * env._obs_noise_std
+        )
+        # prime the obs-delay ring: every slot holds the reset obs, so any delay reads it back
+        env._obs_ring[env_ids] = noisy[:, None, :]
+        return {"obs": noisy.astype(get_global_dtype())}

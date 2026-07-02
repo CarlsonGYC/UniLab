@@ -317,10 +317,26 @@ def main() -> None:
     override = {
         "randomize_payload_mass": bool(args.enable_dr),
         "randomize_payload_inertia": bool(args.enable_dr),
+        "randomize_payload_com": bool(args.enable_dr),
         "randomize_actuators": bool(args.enable_dr),
         "push_payload": bool(args.enable_push),
         "obs_param_noise": 0.0,
     }
+    if not args.enable_dr:  # deterministic sensors/latency for a clean tracking measurement
+        override.update(
+            {
+                "action_delay_steps_max": 0,
+                "obs_delay_steps_max": 0,
+                "ctrl_fb_delay_steps_max": 0,
+                "obs_noise_pos": 0.0,
+                "obs_noise_vel": 0.0,
+                "obs_noise_ang": 0.0,
+                "obs_noise_att": 0.0,
+                "obs_bias_pos": 0.0,
+                "obs_bias_att": 0.0,
+                "obs_bias_ang": 0.0,
+            }
+        )
     if args.eval_mode == "clean":
         override.update(
             {
