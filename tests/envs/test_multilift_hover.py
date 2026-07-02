@@ -80,12 +80,12 @@ def test_va_scale_full_when_curriculum_off(env):
 
 
 def test_push_force_held_and_zeroed_on_reset(env):
-    state = _fresh_state(env)
+    _fresh_state(env)
     for _ in range(30):
-        state = env.step(np.zeros((2, 36), np.float32))
+        env.step(np.zeros((2, 36), np.float32))
     force = env._push_force.copy()
     assert np.linalg.norm(force, axis=-1).max() > 0.0  # wind ramped up (curriculum off -> full)
-    state = env.step(np.zeros((2, 36), np.float32))
+    env.step(np.zeros((2, 36), np.float32))
     step_delta = np.abs(env._push_force - force).max()
     assert step_delta < 0.2  # low-passed: no per-step jumps toward a +/-1 N target
     env.reset(np.array([0]))

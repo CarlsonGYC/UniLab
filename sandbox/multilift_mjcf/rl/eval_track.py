@@ -39,6 +39,10 @@ from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 from unilab.base.registry import ensure_registries, make  # noqa: E402
 from unilab.training.rsl_rl import RslRlVecEnvWrapper, normalize_ppo_train_cfg  # noqa: E402
+from unilab.training.sim2sim import (  # noqa: E402
+    CrossBackendIncompatibleError,
+    policy_load_dim_guard,
+)
 
 
 def _default_train_cfg() -> dict:
@@ -232,7 +236,12 @@ def _load_policy(
         train_cfg.setdefault("runner", {})["logger"] = "none"
         train_cfg["logger"] = "none"
         runner = OnPolicyRunner(wrapped, train_cfg, log_dir=None, device=device)
-        runner.load(str(checkpoint), map_location=device)
+        with policy_load_dim_guard(
+            env_obs_dim=getattr(wrapped, "num_obs", None),
+            env_action_dim=getattr(wrapped, "num_actions", None),
+            algo_name="ppo",
+        ):
+            runner.load(str(checkpoint), map_location=device)
         return runner.get_inference_policy(device=device), "rsl-rl checkpoint"
 
     module = torch.jit.load(str(checkpoint), map_location=device)
@@ -363,7 +372,10 @@ def main() -> None:
         float(env._cfg.max_episode_seconds), eval_seconds + max(1.0, float(env._cfg.ctrl_dt))
     )
     wrapped = RslRlVecEnvWrapper(env, device=args.device)
-    policy, policy_kind = _load_policy(ckpt, run_dir, wrapped, args.device)
+    try:
+        policy, policy_kind = _load_policy(ckpt, run_dir, wrapped, args.device)
+    except CrossBackendIncompatibleError as exc:
+        raise SystemExit(str(exc)) from None
     print(f"[eval_track] checkpoint: {ckpt}")
     print(f"[eval_track] policy kind: {policy_kind}")
     print(f"[eval_track] eval mode: {args.eval_mode} override={override}")
